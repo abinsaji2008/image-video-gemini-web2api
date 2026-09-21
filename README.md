@@ -10,6 +10,18 @@ Generated images are downloaded through the authenticated Gemini session and the
 
 No base64 response and no image proxy API is needed. Vercel documents that public Blob URLs are directly accessible by anyone who has the URL and can be used directly in HTML. citeturn507324search3turn507324search6
 
+## Website
+
+Open the project root after deployment:
+
+```text
+https://YOUR_PROJECT.vercel.app/
+```
+
+The built-in website is a long-running generator. It does not impose Postman's 30-second client timeout: it keeps the browser request open while Gemini generates, shows elapsed time, and displays the final public Blob image URL. The page also has a Cancel button and an optional API-key field.
+
+The website uses the returned `data[0].url` directly in an `<img>` element, so the browser loads the image from public Vercel Blob without calling the image API a second time.
+
 ## Required Vercel setup
 
 Create a **PUBLIC** Vercel Blob store and connect it to this project:
