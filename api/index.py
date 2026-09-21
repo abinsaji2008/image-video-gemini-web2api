@@ -20,7 +20,7 @@ from gemini_webapi import GeminiClient
 from vercel.blob import AsyncBlobClient
 
 LOG = logging.getLogger(__name__)
-APP_VERSION = "6.5-video-12min-timeout-media-fallback"
+APP_VERSION = "6.6-omni-flash-video-default"
 MEDIA_TTL_SEC = 300
 
 app = FastAPI(
@@ -621,7 +621,7 @@ function stopClock(){clearInterval(timerId);timerId=null}
 function clearTTL(){clearInterval(ttlId);ttlId=null;$("ttl").textContent=""}
 function setTTL(ts){expiry=ts*1000;clearTTL();const tick=()=>{const left=Math.max(0,expiry-Date.now());const s=Math.floor(left/1000);if(s<=0){$("ttl").textContent="Media expired — cleanup is scheduled.";clearTTL();$("download").removeAttribute("href");return}$("ttl").textContent="Available for download for about "+Math.ceil(s/60)+" min ("+s+"s)"};tick();ttlId=setInterval(tick,1000)}
 function resetOutput(){$("image").style.display="none";$("video").style.display="none";$("empty").style.display="block";$("meta").classList.add("hidden");clearTTL()}
-function setKind(k){kind=k;$("go").textContent=k==="image"?"Generate Image":"Generate Video";$("prompt").placeholder=k==="image"?"A cinematic futuristic Kerala city at sunset":"A short cinematic video of waves on a tropical beach at sunset";resetOutput()}
+function setKind(k){kind=k;$("go").textContent=k==="image"?"Generate Image":"Generate Video";$("prompt").placeholder=k==="image"?"A cinematic futuristic Kerala city at sunset":"A short cinematic video of waves on a tropical beach at sunset";if(k==="video"){$("model").value="gemini-omni-1.1-flash";$("model").placeholder="Gemini Omni Flash"}else{$("model").value="";$("model").placeholder="Leave empty for default"}resetOutput()}
 document.querySelectorAll(".tab").forEach(b=>b.onclick=()=>{document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));b.classList.add("active");setKind(b.dataset.kind)});
 $("go").onclick=async()=>{
  const prompt=$("prompt").value.trim();if(!prompt){status("Enter a prompt.","err");return}
@@ -808,6 +808,9 @@ async def generate_video(request: Request):
     if model is not None and not isinstance(model, str):
         return error_response(400, "model must be a string", "invalid_request_error")
 
+    # Gemini Omni Flash is the dedicated current video-generation model.
+    video_model = (model or "gemini-omni-1.1-flash").strip()
+
     async def stream_result():
         # Cloudflare can return a gateway error when a long video-generation
         # request produces no bytes for a long period. JSON permits whitespace
@@ -839,7 +842,7 @@ async def generate_video(request: Request):
                     if model:
                         response = await client.generate_content(
                             generation_prompt,
-                            model=model,
+                            model=video_model,
                         )
                     else:
                         response = await client.generate_content(generation_prompt)
@@ -893,7 +896,7 @@ async def generate_video(request: Request):
                         payload = {
                             "created": int(time.time()),
                             "object": "video.generation",
-                            "model": model or "unspecified",
+                            "model": video_model,
                             "data": videos,
                             "text": response.text or "",
                             "note": (
