@@ -1,321 +1,386 @@
 import asyncio
 import json
+import logging
 import os
 import time
-from http.server import BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from typing import Any
 
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from gemini_webapi import GeminiClient
 
-DEFAULT_IMAGE_MODEL = "gemini-flash"
-DEFAULT_VIDEO_MODEL = "gemini-pro"
+LOG = logging.getLogger(__name__)
+APP_VERSION = "3.0-fastapi-cookie"
 
-_COOKIE = None
+app = FastAPI(
+    title="Gemini Web Image/Video API",
+    version=APP_VERSION,
+    docs_url=None,
+    redoc_url=None,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key"],
+)
 
 
-def parse_cookie(value: str):
-    """Parse a cookie header, JSON cookie export, or key=value list."""
+def _cookie_pairs(value: str) -> dict[str, str]:
+    pairs: dict[str, str] = {}
+    for part in value.split(";"):
+        part = part.strip()
+        if "=" not in part:
+            continue
+        key, val = part.split("=", 1)
+        key = key.strip()
+        if key:
+            pairs[key] = val.strip()
+    return pairs
+
+
+def parse_cookie(value: str | None) -> tuple[str | None, str | None]:
+    """Accept a Cookie header, a JSON export, or KEY=VALUE pairs."""
     if not value:
         return None, None
 
-    value = value.strip()
+    raw = value.strip()
+    if not raw:
+        return None, None
 
-    if value.startswith("{"):
-        try:
-            obj = json.loads(value)
-            if isinstance(obj, dict):
-                if isinstance(obj.get("cookie"), str):
-                    value = obj["cookie"]
-                else:
-                    return (
-                        obj.get("__Secure-1PSID") or obj.get("1PSID"),
-                        obj.get("__Secure-1PSIDTS") or obj.get("1PSIDTS"),
-                    )
-        except json.JSONDecodeError:
-            pass
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        parsed = None
 
-    pairs = {}
-    for part in value.split(";"):
-        part = part.strip()
-        if "=" in part:
-            key, val = part.split("=", 1)
-            pairs[key.strip()] = val.strip()
+    if isinstance(parsed, list):
+        by_name: dict[str, str] = {}
+        for item in parsed:
+            if (
+                isinstance(item, dict)
+                and item.get("name")
+                and item.get("value") is not None
+            ):
+                by_name[str(item["name"])] = str(item["value"])
 
+        return (
+            by_name.get("__Secure-1PSID") or by_name.get("1PSID"),
+            by_name.get("__Secure-1PSIDTS") or by_name.get("1PSIDTS"),
+        )
+
+    if isinstance(parsed, dict):
+        nested = parsed.get("cookie")
+        if isinstance(nested, str):
+            raw = nested
+        else:
+            return (
+                parsed.get("__Secure-1PSID") or parsed.get("1PSID"),
+                parsed.get("__Secure-1PSIDTS") or parsed.get("1PSIDTS"),
+            )
+
+    pairs = _cookie_pairs(raw)
     return (
         pairs.get("__Secure-1PSID") or pairs.get("1PSID"),
         pairs.get("__Secure-1PSIDTS") or pairs.get("1PSIDTS"),
     )
 
 
-def get_credentials():
-    global _COOKIE
-
-    if _COOKIE is not None:
-        return _COOKIE
-
-    cookie = os.getenv("GEMINI_COOKIE", "").strip()
-    psid, psidts = parse_cookie(cookie)
-
+def get_credentials() -> tuple[str, str | None]:
+    psid, psidts = parse_cookie(os.getenv("GEMINI_COOKIE"))
     psid = psid or os.getenv("GEMINI_1PSID", "").strip()
-    psidts = psidts or os.getenv("GEMINI_1PSIDTS", "").strip()
+    psidts = psidts or os.getenv("GEMINI_1PSIDTS", "").strip() or None
 
     if not psid:
         raise RuntimeError(
-            "Missing Gemini cookie. Set GEMINI_COOKIE with __Secure-1PSID "
-            "(and optionally __Secure-1PSIDTS)."
+            "Gemini cookie is not configured. Set GEMINI_COOKIE with "
+            "__Secure-1PSID or set GEMINI_1PSID."
         )
 
-    _COOKIE = (psid, psidts)
-    return _COOKIE
+    return psid, psidts
 
 
-def api_authorized(headers):
-    keys = [k.strip() for k in os.getenv("API_KEYS", "").split(",") if k.strip()]
-    if not keys:
+def authorize(request: Request) -> bool:
+    configured = [
+        x.strip() for x in os.getenv("API_KEYS", "").split(",") if x.strip()
+    ]
+    if not configured:
         return True
 
-    auth = headers.get("Authorization", "")
-    token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
-    return token in keys
+    bearer = request.headers.get("authorization", "")
+    token = bearer[7:].strip() if bearer.lower().startswith("bearer ") else ""
+    token = token or request.headers.get("x-api-key", "").strip()
+    return token in configured
 
 
-async def make_client():
+def error_response(
+    status: int, message: str, code: str | None = None
+) -> JSONResponse:
+    payload: dict[str, Any] = {"error": {"message": message}}
+    if code:
+        payload["error"]["type"] = code
+    return JSONResponse(payload, status_code=status)
+
+
+async def create_client() -> GeminiClient:
     psid, psidts = get_credentials()
-    client = GeminiClient(psid, psidts)
+    client = GeminiClient(psid, psidts, proxy=None)
+    timeout = float(os.getenv("GEMINI_TIMEOUT_SEC", "240"))
     await client.init(
-        timeout=float(os.getenv("GEMINI_TIMEOUT_SEC", "240")),
+        timeout=timeout,
         auto_close=False,
         auto_refresh=True,
     )
     return client
 
 
-async def generate(prompt, model_name=None):
-    client = await make_client()
+async def generate(prompt: str, model_name: str | None = None):
+    client = await create_client()
     try:
-        selected_model = None
-        requested = (model_name or os.getenv("GEMINI_MODEL", "")).strip()
-
-        if requested:
-            try:
-                selected_model = client.resolve_model(requested)
-            except Exception:
-                selected_model = None
-
-        return await client.generate_content(
-            prompt,
-            model=selected_model,
-        )
+        # gemini-webapi resolves string model names inside generate_content().
+        if model_name:
+            return await client.generate_content(prompt, model=model_name)
+        return await client.generate_content(prompt)
     finally:
         await client.close()
 
 
-def response_to_dict(response):
-    result = {
-        "text": response.text or "",
-        "images": [],
-        "videos": [],
+def media_dict(obj: Any, kind: str) -> dict[str, Any]:
+    if kind == "image":
+        return {
+            "url": getattr(obj, "url", None),
+            "title": getattr(obj, "title", None),
+            "alt": getattr(obj, "alt", None),
+            "type": (
+                "generated"
+                if obj.__class__.__name__ == "GeneratedImage"
+                else "web"
+            ),
+        }
+
+    return {
+        "url": getattr(obj, "url", None),
+        "title": getattr(obj, "title", None),
+        "thumbnail": getattr(obj, "thumbnail", None),
+        "type": obj.__class__.__name__,
     }
 
-    for image in response.images or []:
-        result["images"].append(
-            {
-                "url": image.url,
-                "title": image.title,
-                "alt": image.alt,
-                "type": (
-                    "generated"
-                    if image.__class__.__name__ == "GeneratedImage"
-                    else "web"
-                ),
-            }
+
+async def request_json(request: Request) -> dict[str, Any] | None:
+    try:
+        body = await request.json()
+    except Exception:
+        return None
+    return body if isinstance(body, dict) else None
+
+
+@app.get("/api")
+@app.get("/api/")
+@app.get("/api/health")
+async def health() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "service": "image-video-gemini-web2api",
+        "auth": "gemini-web-cookie",
+        "version": APP_VERSION,
+    }
+
+
+@app.get("/api/v1/models")
+async def models(request: Request):
+    if not authorize(request):
+        return error_response(401, "invalid API key", "invalid_api_key")
+
+    try:
+        client = await create_client()
+        try:
+            available = client.list_models() or []
+            data = []
+
+            for model in available:
+                name = getattr(model, "model_name", None)
+                if not name:
+                    continue
+
+                data.append(
+                    {
+                        "id": name,
+                        "object": "model",
+                        "owned_by": "google-web",
+                        "name": getattr(model, "display_name", None),
+                        "description": getattr(model, "description", None),
+                    }
+                )
+
+            return {"object": "list", "data": data}
+        finally:
+            await client.close()
+
+    except RuntimeError as exc:
+        return error_response(503, str(exc), "configuration_error")
+    except Exception as exc:
+        LOG.exception("Model discovery failed")
+        return error_response(
+            502,
+            f"Gemini model discovery failed: {exc}",
+            "upstream_error",
         )
 
-    for video in response.videos or []:
-        result["videos"].append(
-            {
-                "url": video.url,
-                "title": video.title,
-                "thumbnail": getattr(video, "thumbnail", None),
-            }
+
+@app.post("/api/v1/images/generations")
+async def generate_image(request: Request):
+    if not authorize(request):
+        return error_response(401, "invalid API key", "invalid_api_key")
+
+    body = await request_json(request)
+    if body is None:
+        return error_response(
+            400, "invalid JSON body", "invalid_request_error"
         )
 
-    return result
+    prompt = body.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return error_response(
+            400, "prompt is required", "invalid_request_error"
+        )
 
+    model = body.get("model")
+    if model is not None and not isinstance(model, str):
+        return error_response(
+            400, "model must be a string", "invalid_request_error"
+        )
 
-def run(coro):
-    return asyncio.run(coro)
+    try:
+        response = await generate(
+            "Generate an image for this request. Return the generated image, "
+            "not a web image.\n\n"
+            + prompt.strip(),
+            model_name=model,
+        )
 
+        images = [
+            media_dict(image, "image")
+            for image in (response.images or [])
+            if getattr(image, "url", None)
+        ]
 
-def clean_path(raw_path):
-    """Normalize Vercel file-function paths to a public API path."""
-    path = urlparse(raw_path).path or "/"
-
-    # Vercel can invoke the Python file with the file path prepended.
-    for prefix in ("/api/index.py", "/api/index"):
-        if path == prefix:
-            return "/"
-        if path.startswith(prefix + "/"):
-            path = path[len(prefix):]
-            break
-
-    # Also accept any prefix before our public API endpoint.
-    for endpoint in (
-        "/v1/images/generations",
-        "/v1/videos/generations",
-        "/v1/models",
-    ):
-        if endpoint in path:
-            path = endpoint
-            break
-
-    if len(path) > 1:
-        path = path.rstrip("/")
-    return path or "/"
-
-
-class handler(BaseHTTPRequestHandler):
-    def send_json(self, status, data):
-        raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
-
-    def read_json(self):
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if length <= 0:
-                return None
-            return json.loads(self.rfile.read(length).decode("utf-8"))
-        except Exception:
-            return None
-
-    def require_auth(self):
-        if api_authorized(self.headers):
-            return True
-        self.send_json(401, {"error": {"message": "invalid API key"}})
-        return False
-
-    def do_OPTIONS(self):
-        self.send_json(204, {})
-
-    def do_GET(self):
-        if not self.require_auth():
-            return
-
-        path = clean_path(self.path)
-
-        if path == "/":
-            self.send_json(
-                200,
-                {
-                    "status": "ok",
-                    "service": "image-video-gemini-web2api",
-                    "auth": "gemini-web-cookie",
-                    "version": "2.0-cookie-image-video",
-                    "build": "200ef3e4",
-                },
+        if not images:
+            return error_response(
+                502,
+                "Gemini completed the request but returned no generated "
+                "image. The account or selected model may not have image "
+                "generation access.",
+                "no_image_generated",
             )
-            return
 
-        if path == "/v1/models":
-            self.send_json(
-                200,
-                {
-                    "object": "list",
-                    "data": [
+        return {
+            "created": int(time.time()),
+            "object": "image.generation",
+            "model": model or "unspecified",
+            "data": images,
+            "text": response.text or "",
+        }
+
+    except ValueError as exc:
+        return error_response(400, str(exc), "invalid_model")
+    except asyncio.TimeoutError:
+        return error_response(504, "Gemini request timed out", "timeout")
+    except RuntimeError as exc:
+        return error_response(503, str(exc), "configuration_error")
+    except Exception as exc:
+        LOG.exception("Image generation failed")
+        return error_response(
+            502,
+            f"Gemini image generation failed: {exc}",
+            "upstream_error",
+        )
+
+
+@app.post("/api/v1/videos/generations")
+async def generate_video(request: Request):
+    if not authorize(request):
+        return error_response(401, "invalid API key", "invalid_api_key")
+
+    body = await request_json(request)
+    if body is None:
+        return error_response(
+            400, "invalid JSON body", "invalid_request_error"
+        )
+
+    prompt = body.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return error_response(
+            400, "prompt is required", "invalid_request_error"
+        )
+
+    model = body.get("model")
+    if model is not None and not isinstance(model, str):
+        return error_response(
+            400, "model must be a string", "invalid_request_error"
+        )
+
+    try:
+        response = await generate(
+            "Generate a short video for this request using Gemini's video "
+            "generation capability.\n\n"
+            + prompt.strip(),
+            model_name=model,
+        )
+
+        videos = [
+            media_dict(video, "video")
+            for video in (response.videos or [])
+            if getattr(video, "url", None)
+        ]
+
+        # Some upstream versions may expose generated video as media.
+        if not videos:
+            for item in getattr(response, "media", None) or []:
+                url = getattr(item, "url", None) or getattr(
+                    item, "mp4_url", None
+                )
+                if url:
+                    videos.append(
                         {
-                            "id": "gemini-flash",
-                            "object": "model",
-                            "owned_by": "google-web",
-                        },
-                        {
-                            "id": "gemini-pro",
-                            "object": "model",
-                            "owned_by": "google-web",
-                        },
-                    ],
-                },
+                            "url": url,
+                            "title": getattr(item, "title", None),
+                            "thumbnail": (
+                                getattr(item, "thumbnail", None)
+                                or getattr(item, "mp4_thumbnail", None)
+                            ),
+                            "type": item.__class__.__name__,
+                        }
+                    )
+
+        if not videos:
+            return error_response(
+                502,
+                "Gemini completed the request but returned no generated "
+                "video. The account or selected model may not have video "
+                "generation access.",
+                "no_video_generated",
             )
-            return
 
-        self.send_json(404, {"error": {"message": "not found"}})
+        return {
+            "created": int(time.time()),
+            "object": "video.generation",
+            "model": model or "unspecified",
+            "data": videos,
+            "text": response.text or "",
+        }
 
-    def do_POST(self):
-        if not self.require_auth():
-            return
-
-        path = clean_path(self.path)
-        body = self.read_json()
-
-        if body is None:
-            self.send_json(400, {"error": {"message": "invalid JSON body"}})
-            return
-
-        try:
-            if path == "/v1/images/generations":
-                prompt = body.get("prompt")
-                if not isinstance(prompt, str) or not prompt.strip():
-                    self.send_json(
-                        400, {"error": {"message": "prompt is required"}}
-                    )
-                    return
-
-                response = run(
-                    generate(
-                        "Generate an image for this request.\n\n"
-                        + prompt.strip(),
-                        model_name=body.get("model"),
-                    )
-                )
-                data = response_to_dict(response)
-
-                self.send_json(
-                    200,
-                    {
-                        "created": int(time.time()),
-                        "object": "image.generation",
-                        "model": body.get("model") or DEFAULT_IMAGE_MODEL,
-                        "data": data["images"],
-                        "text": data["text"],
-                    },
-                )
-                return
-
-            if path == "/v1/videos/generations":
-                prompt = body.get("prompt")
-                if not isinstance(prompt, str) or not prompt.strip():
-                    self.send_json(
-                        400, {"error": {"message": "prompt is required"}}
-                    )
-                    return
-
-                response = run(
-                    generate(
-                        "Generate a video for this request. Create a short video using Gemini's video generation capability.\n\n"
-                        + prompt.strip(),
-                        model_name=body.get("model"),
-                    )
-                )
-                data = response_to_dict(response)
-
-                self.send_json(
-                    200,
-                    {
-                        "created": int(time.time()),
-                        "object": "video.generation",
-                        "model": body.get("model") or DEFAULT_VIDEO_MODEL,
-                        "data": data["videos"],
-                        "text": data["text"],
-                    },
-                )
-                return
-
-            self.send_json(404, {"error": {"message": "not found", "path": self.path}})
-        except Exception as exc:
-            self.send_json(500, {"error": {"message": str(exc)}})
+    except ValueError as exc:
+        return error_response(400, str(exc), "invalid_model")
+    except asyncio.TimeoutError:
+        return error_response(504, "Gemini request timed out", "timeout")
+    except RuntimeError as exc:
+        return error_response(503, str(exc), "configuration_error")
+    except Exception as exc:
+        LOG.exception("Video generation failed")
+        return error_response(
+            502,
+            f"Gemini video generation failed: {exc}",
+            "upstream_error",
+        )
