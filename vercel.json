@@ -5,11 +5,18 @@
       "maxDuration": 300
     }
   },
-  "routes": [
+  "rewrites": [
     {
-      "src": "/(.*)",
-      "dest": "/api/index.py",
-      "methods": ["GET", "POST", "OPTIONS"]
+      "source": "/",
+      "destination": "/api"
+    },
+    {
+      "source": "/v1/:path*",
+      "destination": "/api/v1/:path*"
+    },
+    {
+      "source": "/health",
+      "destination": "/api/health"
     }
   ]
 }
