@@ -1,14 +1,14 @@
 import asyncio
-import base64
 import json
 import logging
 import os
 import time
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from gemini_webapi import GeminiClient
 
 LOG = logging.getLogger(__name__)
@@ -148,68 +148,25 @@ async def generate(prompt: str, model_name: str | None = None):
         await client.close()
 
 
-async def generate_images_with_download(prompt: str, model_name: str | None = None):
-    """
-    Generate images and immediately download them through the authenticated
-    Gemini session. Raw lh3.googleusercontent.com URLs can require the
-    Gemini session/cookies and are not always directly openable in a browser.
-    """
+def make_proxy_url(request: Request, image_url: str) -> str:
+    # Keep the response small: return a short API URL that fetches the image
+    # later through the authenticated Gemini session.
+    base = str(request.base_url).rstrip("/")
+    return f"{base}/api/v1/media/image?url={image_url.encode('utf-8').hex()}"
+
+
+async def fetch_image_with_gemini_session(image_url: str):
     client = await create_client()
     try:
-        if model_name:
-            response = await client.generate_content(prompt, model=model_name)
-        else:
-            response = await client.generate_content(prompt)
-
-        results = []
-        for index, image in enumerate(response.images or []):
-            url = getattr(image, "url", None)
-            item = media_dict(image, "image")
-
-            if not url:
-                results.append(item)
-                continue
-
-            filename = f"/tmp/gemini-image-{time.time_ns()}-{index}.png"
-
-            try:
-                saved_path = await image.save(
-                    path="/tmp",
-                    filename=filename,
-                    verbose=False,
-                    client=client.client,
-                    full_size=True,
-                )
-
-                with open(saved_path, "rb") as file:
-                    raw = file.read()
-
-                mime = "image/png"
-                if raw.startswith(b"\xff\xd8\xff"):
-                    mime = "image/jpeg"
-                elif raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
-                    mime = "image/webp"
-
-                encoded = base64.b64encode(raw).decode("ascii")
-                item["mime_type"] = mime
-                item["b64_json"] = encoded
-                item["data_url"] = f"data:{mime};base64,{encoded}"
-                item["downloaded"] = True
-
-                try:
-                    os.remove(saved_path)
-                except OSError:
-                    pass
-
-            except Exception as exc:
-                LOG.warning("Authenticated image download failed: %s", exc)
-                item["downloaded"] = False
-                item["download_error"] = str(exc)
-
-            results.append(item)
-
-        return response, results
-
+        response = await client.client.get(
+            image_url,
+            headers={
+                "Origin": "https://gemini.google.com",
+                "Referer": "https://gemini.google.com/",
+            },
+            allow_redirects=True,
+        )
+        return response.status_code, response.headers, response.content
     finally:
         await client.close()
 
@@ -320,16 +277,34 @@ async def generate_image(request: Request):
         )
 
     try:
-        response, images = await generate_images_with_download(
+        response = await generate(
             "Generate an image for this request. Return the generated image, "
             "not a web image.\n\n"
             + prompt.strip(),
             model_name=model,
         )
 
-        generated = [image for image in images if image.get("url")]
+        images = []
+        for image in response.images or []:
+            url = getattr(image, "url", None)
+            if not url:
+                continue
 
-        if not generated:
+            images.append(
+                {
+                    "url": url,
+                    "proxy_url": make_proxy_url(request, url),
+                    "title": getattr(image, "title", None),
+                    "alt": getattr(image, "alt", None),
+                    "type": (
+                        "generated"
+                        if image.__class__.__name__ == "GeneratedImage"
+                        else "web"
+                    ),
+                }
+            )
+
+        if not images:
             return error_response(
                 502,
                 "Gemini completed the request but returned no generated image.",
@@ -340,11 +315,12 @@ async def generate_image(request: Request):
             "created": int(time.time()),
             "object": "image.generation",
             "model": model or "unspecified",
-            "data": generated,
+            "data": images,
             "text": response.text or "",
             "note": (
-                "Use data_url or b64_json to open the image. The raw Google "
-                "lh3 URL may require the Gemini session and may expire."
+                "Open proxy_url. The proxy fetches the Google-hosted image "
+                "using the authenticated Gemini session, so the large "
+                "base64 payload is no longer returned by this endpoint."
             ),
         }
 
@@ -360,6 +336,61 @@ async def generate_image(request: Request):
             502,
             f"Gemini image generation failed: {exc}",
             "upstream_error",
+        )
+
+
+@app.get("/api/v1/media/image")
+async def media_image(request: Request):
+    if not authorize(request):
+        return error_response(401, "invalid API key", "invalid_api_key")
+
+    encoded = request.query_params.get("url", "")
+    if not encoded:
+        return error_response(400, "url is required", "invalid_request_error")
+
+    try:
+        # Hex is used instead of base64 to keep the URL unambiguous in a query string.
+        image_url = bytes.fromhex(encoded).decode("utf-8")
+    except Exception:
+        return error_response(400, "invalid image URL token", "invalid_request_error")
+
+    parsed = urlparse(image_url)
+    if parsed.scheme != "https" or parsed.netloc not in {
+        "lh3.googleusercontent.com",
+        "googleusercontent.com",
+    }:
+        return error_response(400, "invalid Google image URL", "invalid_request_error")
+
+    try:
+        status, headers, content = await fetch_image_with_gemini_session(image_url)
+        if status != 200:
+            return error_response(
+                502,
+                f"Google image server returned HTTP {status}",
+                "media_upstream_error",
+            )
+
+        content_type = headers.get("content-type", "image/png")
+        if not content_type.startswith("image/"):
+            content_type = "image/png"
+
+        return Response(
+            content=content,
+            media_type=content_type,
+            headers={
+                "Cache-Control": "private, max-age=300",
+                "Content-Disposition": "inline",
+            },
+        )
+
+    except asyncio.TimeoutError:
+        return error_response(504, "Image download timed out", "timeout")
+    except Exception as exc:
+        LOG.exception("Image proxy failed")
+        return error_response(
+            502,
+            f"Image proxy failed: {exc}",
+            "media_upstream_error",
         )
 
 @app.post("/api/v1/videos/generations")
