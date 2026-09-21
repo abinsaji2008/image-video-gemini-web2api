@@ -20,8 +20,12 @@ from gemini_webapi import GeminiClient
 from vercel.blob import AsyncBlobClient
 
 LOG = logging.getLogger(__name__)
-APP_VERSION = "6.8-text-chat-api"
-MEDIA_TTL_SEC = 300
+APP_VERSION = "7.0-long-video-image-fix"
+MEDIA_TTL_SEC = 3600
+IMAGE_MAX_ATTEMPTS = max(1, int(os.getenv("GEMINI_IMAGE_MAX_ATTEMPTS", "2")))
+VIDEO_TOTAL_TIMEOUT_SEC = float(os.getenv("GEMINI_VIDEO_MAX_SECONDS", "780"))
+VIDEO_MAX_ATTEMPTS = max(1, int(os.getenv("GEMINI_VIDEO_MAX_ATTEMPTS", "2")))
+VIDEO_RETRY_MIN_REMAINING_SEC = float(os.getenv("GEMINI_VIDEO_RETRY_MIN_REMAINING_SEC", "180"))
 
 app = FastAPI(
     title="Gemini Web Image/Video API",
@@ -504,33 +508,76 @@ async def generate_and_publish_images(
     full_size: bool = False,
     oidc_token: str | None = None,
 ):
-    client = await create_gemini_client()
-    try:
-        if model_name:
-            response = await client.generate_content(
-                prompt,
-                model=model_name,
-            )
-        else:
-            response = await client.generate_content(prompt)
+    """
+    Generate an AI image through the Gemini Web session.
 
-        images: list[dict[str, Any]] = []
-        for image in response.images or []:
-            if not getattr(image, "url", None):
-                continue
+    Gemini Web can occasionally answer a first image request without exposing
+    a generated-image object to the reverse-engineered client. Use a fresh
+    session and a stronger generation prompt for a second attempt.
+    """
+    prompts = [
+        prompt.strip(),
+        (
+            "Create exactly one AI-generated image for the user's request. "
+            "Do not return a web image or only a textual description. "
+            "The final response must contain the generated image.\n\n"
+            + prompt.strip()
+        ),
+    ]
 
-            images.append(
-                await publish_generated_image(
-                    image,
-                    client,
-                    full_size=full_size,
-                    oidc_token=oidc_token,
+    last_response = None
+    last_error: Exception | None = None
+
+    for attempt in range(1, IMAGE_MAX_ATTEMPTS + 1):
+        client = None
+        try:
+            client = await create_gemini_client()
+            generation_prompt = prompts[min(attempt - 1, len(prompts) - 1)]
+
+            if model_name:
+                response = await client.generate_content(
+                    generation_prompt,
+                    model=model_name,
                 )
+            else:
+                response = await client.generate_content(generation_prompt)
+
+            last_response = response
+            candidates = list(response.images or [])
+            usable_images = [
+                image for image in candidates
+                if getattr(image, "url", None)
+            ]
+
+            if usable_images:
+                images: list[dict[str, Any]] = []
+                for image in usable_images:
+                    images.append(
+                        await publish_generated_image(
+                            image,
+                            client,
+                            full_size=full_size,
+                            oidc_token=oidc_token,
+                        )
+                    )
+                return response, images, attempt, None
+
+            last_error = RuntimeError(
+                "Gemini returned no generated-image object."
             )
 
-        return response, images
-    finally:
-        await client.close()
+        except Exception as exc:
+            last_error = exc
+            if attempt >= IMAGE_MAX_ATTEMPTS:
+                raise
+        finally:
+            if client is not None:
+                try:
+                    await client.close()
+                except Exception:
+                    pass
+
+    return last_response, [], IMAGE_MAX_ATTEMPTS, last_error
 
 
 async def request_json(request: Request) -> dict[str, Any] | None:
@@ -590,7 +637,7 @@ pre{margin:0;background:#070c16;border:1px solid #27344f;border-radius:11px;padd
 </head>
 <body>
 <main>
-<div class="top"><h1>Gemini Image + Video Generator</h1><p>Gemini Web cookies on the server. Generated media is stored in public Vercel Blob and automatically deleted after 5 minutes.</p></div>
+<div class="top"><h1>Gemini Image + Video Generator</h1><p>Gemini Web cookies on the server. Generated media is stored in public Vercel Blob and automatically deleted after about 1 hour.</p></div>
 <div class="tabs"><button class="tab active" data-kind="image">Image</button><button class="tab" data-kind="video">Video</button></div>
 <div class="grid">
 <section class="card">
@@ -621,7 +668,7 @@ function stopClock(){clearInterval(timerId);timerId=null}
 function clearTTL(){clearInterval(ttlId);ttlId=null;$("ttl").textContent=""}
 function setTTL(ts){expiry=ts*1000;clearTTL();const tick=()=>{const left=Math.max(0,expiry-Date.now());const s=Math.floor(left/1000);if(s<=0){$("ttl").textContent="Media expired — cleanup is scheduled.";clearTTL();$("download").removeAttribute("href");return}$("ttl").textContent="Available for download for about "+Math.ceil(s/60)+" min ("+s+"s)"};tick();ttlId=setInterval(tick,1000)}
 function resetOutput(){$("image").style.display="none";$("video").style.display="none";$("empty").style.display="block";$("meta").classList.add("hidden");clearTTL()}
-function setKind(k){kind=k;$("go").textContent=k==="image"?"Generate Image":"Generate Video";$("prompt").placeholder=k==="image"?"A cinematic futuristic Kerala city at sunset":"A short cinematic video of waves on a tropical beach at sunset";if(k==="video"){$("model").value="gemini-omni-1.1-flash";$("model").placeholder="Gemini Omni Flash (automatic video mode)"}else{$("model").value="";$("model").placeholder="Leave empty for default"}resetOutput()}
+function setKind(k){kind=k;$("go").textContent=k==="image"?"Generate Image":"Generate Video";$("prompt").placeholder=k==="image"?"A cinematic futuristic Kerala city at sunset":"A short cinematic video of waves on a tropical beach at sunset";if(k==="video"){$("model").value="";$("model").placeholder="Leave empty for automatic video model"}else{$("model").value="";$("model").placeholder="Leave empty for default"}resetOutput()}
 document.querySelectorAll(".tab").forEach(b=>b.onclick=()=>{document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));b.classList.add("active");setKind(b.dataset.kind)});
 $("go").onclick=async()=>{
  const prompt=$("prompt").value.trim();if(!prompt){status("Enter a prompt.","err");return}
@@ -791,83 +838,80 @@ async def generate_image(request: Request):
 
     body = await request_json(request)
     if body is None:
-        return error_response(
-            400,
-            "invalid JSON body",
-            "invalid_request_error",
-        )
+        return error_response(400, "invalid JSON body", "invalid_request_error")
 
     prompt = body.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
-        return error_response(
-            400,
-            "prompt is required",
-            "invalid_request_error",
-        )
+        return error_response(400, "prompt is required", "invalid_request_error")
 
     model = body.get("model")
     if model is not None and not isinstance(model, str):
-        return error_response(
-            400,
-            "model must be a string",
-            "invalid_request_error",
-        )
+        return error_response(400, "model must be a string", "invalid_request_error")
 
-    # Default to preview-size download for speed. Set full_size=true when
-    # the larger generated image is required.
     full_size = bool(body.get("full_size", False))
 
     try:
-        response, images = await generate_and_publish_images(
-            "Generate an image for this request. Return the generated image, "
-            "not a web image.\n\n"
-            + prompt.strip(),
+        response, images, attempts, generation_error = await generate_and_publish_images(
+            (
+                "Generate an AI image for this request. "
+                "Return the generated image, not a web image or only text.\n\n"
+                + prompt.strip()
+            ),
             model_name=model,
             full_size=full_size,
             oidc_token=request.headers.get("x-vercel-oidc-token"),
         )
 
         if not images:
-            return error_response(
-                502,
-                "Gemini completed the request but returned no generated image.",
-                "no_image_generated",
+            details = {
+                "attempts": attempts,
+                "images_returned": len(response.images or []) if response else 0,
+                "text": response.text or "" if response else "",
+                "check": (
+                    "Use an account with Gemini image generation enabled and "
+                    "do not force a text-only model."
+                ),
+            }
+            if generation_error:
+                details["last_error"] = str(generation_error)
+
+            return JSONResponse(
+                {
+                    "error": {
+                        "message": (
+                            "Gemini completed the request but exposed no "
+                            "generated image to the WebAPI client."
+                        ),
+                        "type": "no_image_generated",
+                        "retryable": False,
+                    },
+                    "details": details,
+                },
+                status_code=502,
             )
 
         return {
             "created": int(time.time()),
             "object": "image.generation",
-            "model": model or "unspecified",
+            "model": model or "automatic",
             "data": images,
             "text": response.text or "",
+            "attempt": attempts,
             "note": (
-                "The returned url is a public Vercel Blob URL. Put it "
-                "directly in an HTML img src; no proxy API or base64 is needed. "
-                "The blob is scheduled for automatic deletion after 5 minutes."
+                "The returned URL is a public Vercel Blob URL. "
+                "Media retention is about 1 hour."
             ),
         }
 
     except ValueError as exc:
         return error_response(400, str(exc), "invalid_model")
     except asyncio.TimeoutError:
-        return error_response(
-            504,
-            "Gemini request timed out",
-            "timeout",
-        )
+        return error_response(504, "Gemini image generation timed out", "timeout")
     except RuntimeError as exc:
-        return error_response(
-            503,
-            str(exc),
-            "configuration_error",
-        )
+        return error_response(503, str(exc), "configuration_error")
     except Exception as exc:
         LOG.exception("Image generation failed")
-        return error_response(
-            502,
-            f"Gemini image generation failed: {exc}",
-            "upstream_error",
-        )
+        return error_response(502, f"Gemini image generation failed: {exc}", "upstream_error")
 
 
 @app.post("/api/v1/videos/generations")
@@ -887,26 +931,85 @@ async def generate_video(request: Request):
     if model is not None and not isinstance(model, str):
         return error_response(400, "model must be a string", "invalid_request_error")
 
-    # The website presents Gemini Omni Flash, but gemini-webapi discovers
-    # ordinary chat models separately. For the video capability, let Google
-    # select the video backend when Omni Flash is requested instead of forcing
-    # the model name through the ordinary chat-model parameter.
-    requested_video_model = (model or "gemini-omni-1.1-flash").strip()
-    generation_model = (
-        None
-        if requested_video_model.lower() in {
-            "gemini-omni-1.1-flash",
-            "omni-flash",
-            "omni flash",
-        }
-        else requested_video_model
-    )
+    # Do not force the obsolete/hard-coded "Omni" alias. With no ordinary
+    # chat model supplied, Gemini Web can select the account's video backend.
+    requested_video_model = (model or "").strip()
+    if requested_video_model.lower() in {
+        "",
+        "auto",
+        "automatic",
+        "gemini-omni-1.1-flash",
+        "omni-flash",
+        "omni flash",
+    }:
+        generation_model = None
+        public_model = "automatic"
+    else:
+        generation_model = requested_video_model
+        public_model = requested_video_model
+
+    async def generate_video_once(
+        generation_prompt: str,
+        per_attempt_timeout: float,
+    ) -> tuple[dict[str, Any], Any]:
+        async def _work():
+            client = await create_gemini_client(timeout_sec=per_attempt_timeout)
+            try:
+                if generation_model:
+                    response = await client.generate_content(
+                        generation_prompt,
+                        model=generation_model,
+                    )
+                else:
+                    response = await client.generate_content(generation_prompt)
+
+                video_objects = list(response.videos or [])
+                if not video_objects:
+                    for media in response.media or []:
+                        if media.__class__.__name__ == "GeneratedMedia":
+                            video_objects.append(media)
+
+                if not video_objects:
+                    raise RuntimeError("Gemini returned no generated video object.")
+
+                published = []
+                for video in video_objects:
+                    if not getattr(video, "url", None):
+                        continue
+                    published.append(
+                        await publish_generated_video(
+                            video,
+                            client,
+                            oidc_token=request.headers.get("x-vercel-oidc-token"),
+                        )
+                    )
+
+                if not published:
+                    raise RuntimeError(
+                        "Gemini returned video metadata but no downloadable video URL."
+                    )
+
+                return (
+                    {
+                        "created": int(time.time()),
+                        "object": "video.generation",
+                        "model": public_model,
+                        "data": published,
+                        "text": response.text or "",
+                    },
+                    response,
+                )
+            finally:
+                try:
+                    await client.close()
+                except Exception:
+                    pass
+
+        return await asyncio.wait_for(_work(), timeout=per_attempt_timeout)
 
     async def stream_result():
-        # Cloudflare can return a gateway error when a long video-generation
-        # request produces no bytes for a long period. JSON permits whitespace
-        # before the value, so send a small heartbeat while Gemini renders.
-        # The browser/Postman still receives one normal JSON document at the end.
+        # Keep the HTTP response active while Gemini renders. The total
+        # application window is bounded below Vercel's 800-second limit.
         queue: asyncio.Queue[str | None] = asyncio.Queue()
 
         async def heartbeat():
@@ -918,145 +1021,116 @@ async def generate_video(request: Request):
                 return
 
         async def work():
-            client = None
+            started = time.monotonic()
+            deadline = started + max(60.0, VIDEO_TOTAL_TIMEOUT_SEC)
             last_error: Exception | None = None
 
+            generation_prompt = (
+                "Generate a short AI video for this request. "
+                "Return the generated video, not only a text description.\n\n"
+                + prompt.strip()
+            )
+
             try:
-                video_timeout = float(
-                    os.getenv("GEMINI_VIDEO_TIMEOUT_SEC", "540")
-                )
-                generation_prompt = (
-                    "Generate a short video for this request using Gemini's "
-                    "video generation capability. Return the generated video, "
-                    "not only a text description.\n\n"
-                    + prompt.strip()
-                )
-
-                # Google can silently abort a WebAPI generation stream. Retry
-                # with a completely fresh Gemini session rather than reusing a
-                # client whose transport was already closed by gemini-webapi.
-                for attempt in range(1, 4):
-                    client = None
-                    try:
-                        client = await create_gemini_client(
-                            timeout_sec=video_timeout
-                        )
-
-                        if generation_model:
-                            response = await client.generate_content(
-                                generation_prompt,
-                                model=generation_model,
-                            )
-                        else:
-                            response = await client.generate_content(
-                                generation_prompt
-                            )
-
-                        videos = []
-                        video_objects = list(response.videos or [])
-
-                        # Newer gemini-webapi responses can expose generated
-                        # video through response.media as GeneratedMedia.
-                        if not video_objects:
-                            for media in response.media or []:
-                                if media.__class__.__name__ == "GeneratedMedia":
-                                    video_objects.append(media)
-
-                        for video in video_objects:
-                            if not getattr(video, "url", None):
-                                continue
-                            videos.append(
-                                await publish_generated_video(
-                                    video,
-                                    client,
-                                    oidc_token=request.headers.get(
-                                        "x-vercel-oidc-token"
-                                    ),
-                                )
-                            )
-
-                        if videos:
-                            payload = {
-                                "created": int(time.time()),
-                                "object": "video.generation",
-                                "model": requested_video_model,
-                                "data": videos,
-                                "text": response.text or "",
-                                "attempt": attempt,
-                                "note": (
-                                    "The returned URL is a public Vercel Blob URL and "
-                                    "is scheduled for automatic deletion after 5 minutes."
-                                ),
-                            }
-                            break
-
-                        payload = {
-                            "error": {
-                                "message": (
-                                    "Gemini completed the request but returned no "
-                                    "generated video."
-                                ),
-                                "type": "video_feature_unavailable",
-                            },
-                            "details": {
-                                "videos_returned": len(response.videos or []),
-                                "media_returned": len(response.media or []),
-                                "video_objects_checked": len(video_objects),
-                                "text": response.text or "",
-                                "attempt": attempt,
-                                "check": (
-                                    "Verify that Create video is available in Gemini "
-                                    "for the same Google account."
-                                ),
-                            },
-                        }
-
-                        # Empty video output is not a transport exception, so do
-                        # not blindly spend all retry attempts.
+                for attempt in range(1, VIDEO_MAX_ATTEMPTS + 1):
+                    remaining = deadline - time.monotonic()
+                    if remaining < 30:
                         break
+
+                    per_attempt = min(remaining - 10, 420.0)
+
+                    try:
+                        payload, _response = await generate_video_once(
+                            generation_prompt,
+                            per_attempt,
+                        )
+                        payload["attempt"] = attempt
+                        payload["elapsed_seconds"] = round(
+                            time.monotonic() - started, 1
+                        )
+                        payload["note"] = (
+                            "Video generation is allowed to run for up to "
+                            f"{int(VIDEO_TOTAL_TIMEOUT_SEC)} seconds. "
+                            "The public Blob result is retained for about 1 hour."
+                        )
+                        return payload
 
                     except Exception as exc:
                         last_error = exc
                         message = str(exc)
-                        retryable = "silently aborted by Google" in message.lower()
+                        silent_abort = "silently aborted by google" in message.lower()
+                        remaining = deadline - time.monotonic()
 
-                        if not retryable or attempt >= 3:
-                            raise
+                        should_retry = (
+                            silent_abort
+                            and attempt < VIDEO_MAX_ATTEMPTS
+                            and remaining >= VIDEO_RETRY_MIN_REMAINING_SEC
+                        )
+                        if should_retry:
+                            await asyncio.sleep(min(5, max(1, remaining - 1)))
+                            continue
+                        break
 
-                        await asyncio.sleep(2 * attempt)
+                if last_error:
+                    msg = str(last_error)
+                    return {
+                        "error": {
+                            "message": f"Gemini video generation failed: {msg}",
+                            "type": (
+                                "upstream_aborted"
+                                if "silently aborted by google" in msg.lower()
+                                else "upstream_error"
+                            ),
+                            "retryable": False,
+                        },
+                        "details": {
+                            "elapsed_seconds": round(time.monotonic() - started, 1),
+                            "max_seconds": int(VIDEO_TOTAL_TIMEOUT_SEC),
+                            "attempt_limit": VIDEO_MAX_ATTEMPTS,
+                            "model": public_model,
+                        },
+                    }
 
-                    finally:
-                        if client is not None:
-                            try:
-                                await client.close()
-                            except Exception:
-                                pass
-                            client = None
-
-            except ValueError as exc:
-                payload = {
-                    "error": {"message": str(exc), "type": "invalid_model"}
+                return {
+                    "error": {
+                        "message": (
+                            "Gemini did not return a generated video before "
+                            "the configured timeout window."
+                        ),
+                        "type": "timeout",
+                        "retryable": False,
+                    },
+                    "details": {
+                        "elapsed_seconds": round(time.monotonic() - started, 1),
+                        "max_seconds": int(VIDEO_TOTAL_TIMEOUT_SEC),
+                        "model": public_model,
+                    },
                 }
+
             except asyncio.TimeoutError:
-                payload = {
-                    "error": {"message": "Gemini request timed out", "type": "timeout"}
+                return {
+                    "error": {
+                        "message": (
+                            "Gemini video generation timed out after "
+                            f"{int(VIDEO_TOTAL_TIMEOUT_SEC)} seconds."
+                        ),
+                        "type": "timeout",
+                        "retryable": False,
+                    }
                 }
+            except ValueError as exc:
+                return {"error": {"message": str(exc), "type": "invalid_model"}}
             except RuntimeError as exc:
-                payload = {
-                    "error": {"message": str(exc), "type": "configuration_error"}
-                }
+                return {"error": {"message": str(exc), "type": "configuration_error"}}
             except Exception as exc:
                 LOG.exception("Video generation failed")
-                payload = {
+                return {
                     "error": {
                         "message": f"Gemini video generation failed: {exc}",
                         "type": "upstream_error",
-                        "retryable": "silently aborted by Google" in str(exc).lower(),
+                        "retryable": False,
                     }
                 }
-
-            await queue.put(None)
-            return payload
 
         hb = asyncio.create_task(heartbeat())
         task = asyncio.create_task(work())
@@ -1258,4 +1332,3 @@ async def cleanup_expired_media(request: Request):
     except Exception as exc:
         LOG.exception("Media cleanup failed")
         return error_response(502, f"Media cleanup failed: {exc}", "cleanup_error")
-
