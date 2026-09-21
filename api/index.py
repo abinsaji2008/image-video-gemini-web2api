@@ -7,6 +7,9 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode
+from urllib.request import Request as UrlRequest, urlopen
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,7 +18,7 @@ from gemini_webapi import GeminiClient
 from vercel.blob import AsyncBlobClient
 
 LOG = logging.getLogger(__name__)
-APP_VERSION = "5.1-public-blob-token"
+APP_VERSION = "5.2-public-blob-oidc"
 
 app = FastAPI(
     title="Gemini Web Image/Video API",
@@ -199,35 +202,94 @@ async def publish_generated_image(
             f"image-{time.time_ns()}.png"
         )
 
-        # Vercel Blob requires the project's Blob read/write token.
-        # Accept both names used by Vercel integrations.
         blob_token = (
             os.getenv("BLOB_READ_WRITE_TOKEN", "").strip()
             or os.getenv("VERCEL_BLOB_READ_WRITE_TOKEN", "").strip()
         )
-        if not blob_token:
-            raise RuntimeError(
-                "Vercel Blob is not configured. Create/connect a PUBLIC Vercel Blob store "
-                "to this project and expose BLOB_READ_WRITE_TOKEN in the Production "
-                "environment, then redeploy."
+        oidc_token = os.getenv("VERCEL_OIDC_TOKEN", "").strip()
+        store_id = os.getenv("BLOB_STORE_ID", "").strip()
+
+        # New Vercel Blob connections use OIDC. The Python Blob SDK version
+        # used by this project still follows the read/write-token path, so
+        # handle OIDC directly against the same Vercel Blob API used by the
+        # official SDK. BLOB_STORE_ID identifies the connected store.
+        if oidc_token and store_id:
+            normalized_store_id = (
+                store_id[len("store_"):]
+                if store_id.startswith("store_")
+                else store_id
             )
 
-        async with AsyncBlobClient(token=blob_token) as blob_client:
-            uploaded = await blob_client.put(
-                pathname,
-                raw,
-                access="public",
-                content_type=content_type,
-                add_random_suffix=True,
+            query = urlencode({"pathname": pathname})
+            blob_api_url = f"https://vercel.com/api/blob/?{query}"
+            request_id = (
+                f"{normalized_store_id}:{time.time_ns()}"
             )
+            headers = {
+                "Authorization": f"Bearer {oidc_token}",
+                "Content-Type": content_type,
+                "x-vercel-blob-store-id": normalized_store_id,
+                "x-api-blob-request-id": request_id,
+                "x-api-blob-request-attempt": "0",
+                "x-api-version": "12",
+                "x-content-length": str(len(raw)),
+            }
 
-        return {
-            "url": uploaded.url,
-            "title": getattr(image, "title", None),
-            "alt": getattr(image, "alt", None),
-            "type": "generated",
-            "mime_type": content_type,
-        }
+            def upload_oidc() -> dict[str, Any]:
+                req = UrlRequest(
+                    blob_api_url,
+                    data=raw,
+                    method="PUT",
+                    headers=headers,
+                )
+                try:
+                    with urlopen(req, timeout=120) as response:
+                        payload = response.read().decode("utf-8")
+                        return json.loads(payload)
+                except HTTPError as exc:
+                    detail = exc.read().decode("utf-8", errors="replace")
+                    raise RuntimeError(
+                        f"Vercel Blob OIDC upload failed (HTTP {exc.code}): {detail}"
+                    ) from exc
+                except URLError as exc:
+                    raise RuntimeError(
+                        f"Vercel Blob OIDC upload connection failed: {exc.reason}"
+                    ) from exc
+
+            uploaded = await asyncio.to_thread(upload_oidc)
+
+            return {
+                "url": uploaded["url"],
+                "title": getattr(image, "title", None),
+                "alt": getattr(image, "alt", None),
+                "type": "generated",
+                "mime_type": content_type,
+            }
+
+        # Backwards-compatible path for stores that still provide a token.
+        if blob_token:
+            async with AsyncBlobClient(token=blob_token) as blob_client:
+                uploaded = await blob_client.put(
+                    pathname,
+                    raw,
+                    access="public",
+                    content_type=content_type,
+                    add_random_suffix=True,
+                )
+
+            return {
+                "url": uploaded.url,
+                "title": getattr(image, "title", None),
+                "alt": getattr(image, "alt", None),
+                "type": "generated",
+                "mime_type": content_type,
+            }
+
+        raise RuntimeError(
+            "Vercel Blob is not configured. This project expects OIDC "
+            "(VERCEL_OIDC_TOKEN + BLOB_STORE_ID) or a BLOB_READ_WRITE_TOKEN. "
+            "Reconnect the Blob store and redeploy."
+        )
 
     finally:
         try:
