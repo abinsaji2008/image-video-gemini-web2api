@@ -15,12 +15,12 @@ from urllib.request import Request as UrlRequest, urlopen
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from gemini_webapi import GeminiClient
 from vercel.blob import AsyncBlobClient
 
 LOG = logging.getLogger(__name__)
-APP_VERSION = "6.1-video-save-result-fix"
+APP_VERSION = "6.2-video-cloudflare-heartbeat"
 MEDIA_TTL_SEC = 300
 
 app = FastAPI(
@@ -798,71 +798,130 @@ async def generate_video(request: Request):
     if model is not None and not isinstance(model, str):
         return error_response(400, "model must be a string", "invalid_request_error")
 
-    try:
-        client = await create_gemini_client()
-        try:
-            generation_prompt = (
-                "Generate a short video for this request using Gemini's "
-                "video generation capability.\n\n"
-                + prompt.strip()
-            )
+    async def stream_result():
+        # Cloudflare can return a gateway error when a long video-generation
+        # request produces no bytes for a long period. JSON permits whitespace
+        # before the value, so send a small heartbeat while Gemini renders.
+        # The browser/Postman still receives one normal JSON document at the end.
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
 
-            if model:
-                response = await client.generate_content(
-                    generation_prompt,
-                    model=model,
-                )
-            else:
-                response = await client.generate_content(generation_prompt)
+        async def heartbeat():
+            try:
+                while True:
+                    await asyncio.sleep(10)
+                    await queue.put(" \n")
+            except asyncio.CancelledError:
+                return
 
-            videos = []
-            for video in response.videos or []:
-                if not getattr(video, "url", None):
-                    continue
-                videos.append(
-                    await publish_generated_video(
-                        video,
-                        client,
-                        oidc_token=request.headers.get("x-vercel-oidc-token"),
+        async def work():
+            try:
+                client = await create_gemini_client()
+                try:
+                    generation_prompt = (
+                        "Generate a short video for this request using Gemini's "
+                        "video generation capability.\n\n"
+                        + prompt.strip()
                     )
-                )
 
-            if not videos:
-                return error_response(
-                    502,
-                    "Gemini completed the request but returned no generated "
-                    "video. Your Gemini account or selected model may not have "
-                    "video generation access.",
-                    "no_video_generated",
-                )
+                    if model:
+                        response = await client.generate_content(
+                            generation_prompt,
+                            model=model,
+                        )
+                    else:
+                        response = await client.generate_content(generation_prompt)
 
-            return {
-                "created": int(time.time()),
-                "object": "video.generation",
-                "model": model or "unspecified",
-                "data": videos,
-                "text": response.text or "",
-                "note": (
-                    "The returned URL is a public Vercel Blob URL and is scheduled "
-                    "for automatic deletion after 5 minutes."
-                ),
-            }
+                    videos = []
+                    for video in response.videos or []:
+                        if not getattr(video, "url", None):
+                            continue
+                        videos.append(
+                            await publish_generated_video(
+                                video,
+                                client,
+                                oidc_token=request.headers.get("x-vercel-oidc-token"),
+                            )
+                        )
+
+                    if not videos:
+                        payload = {
+                            "error": {
+                                "message": (
+                                    "Gemini completed the request but returned no "
+                                    "generated video. Your Gemini account or selected "
+                                    "model may not have video generation access."
+                                ),
+                                "type": "no_video_generated",
+                            }
+                        }
+                    else:
+                        payload = {
+                            "created": int(time.time()),
+                            "object": "video.generation",
+                            "model": model or "unspecified",
+                            "data": videos,
+                            "text": response.text or "",
+                            "note": (
+                                "The returned URL is a public Vercel Blob URL and "
+                                "is scheduled for automatic deletion after 5 minutes."
+                            ),
+                        }
+                finally:
+                    await client.close()
+
+            except ValueError as exc:
+                payload = {
+                    "error": {"message": str(exc), "type": "invalid_model"}
+                }
+            except asyncio.TimeoutError:
+                payload = {
+                    "error": {"message": "Gemini request timed out", "type": "timeout"}
+                }
+            except RuntimeError as exc:
+                payload = {
+                    "error": {"message": str(exc), "type": "configuration_error"}
+                }
+            except Exception as exc:
+                LOG.exception("Video generation failed")
+                payload = {
+                    "error": {
+                        "message": f"Gemini video generation failed: {exc}",
+                        "type": "upstream_error",
+                    }
+                }
+
+            await queue.put(None)
+            return payload
+
+        hb = asyncio.create_task(heartbeat())
+        task = asyncio.create_task(work())
+
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield item.encode("utf-8")
+
+            payload = await task
+            yield json.dumps(payload, ensure_ascii=False).encode("utf-8")
         finally:
-            await client.close()
+            hb.cancel()
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
-    except ValueError as exc:
-        return error_response(400, str(exc), "invalid_model")
-    except asyncio.TimeoutError:
-        return error_response(504, "Gemini request timed out", "timeout")
-    except RuntimeError as exc:
-        return error_response(503, str(exc), "configuration_error")
-    except Exception as exc:
-        LOG.exception("Video generation failed")
-        return error_response(
-            502,
-            f"Gemini video generation failed: {exc}",
-            "upstream_error",
-        )
+    return StreamingResponse(
+        stream_result(),
+        media_type="application/json",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 async def _list_and_delete_expired_blobs(
