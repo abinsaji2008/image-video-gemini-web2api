@@ -3,8 +3,10 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -18,7 +20,8 @@ from gemini_webapi import GeminiClient
 from vercel.blob import AsyncBlobClient
 
 LOG = logging.getLogger(__name__)
-APP_VERSION = "5.4-clean-temp-media"
+APP_VERSION = "6.0-image-video-download-ttl"
+MEDIA_TTL_SEC = 300
 
 app = FastAPI(
     title="Gemini Web Image/Video API",
@@ -135,6 +138,21 @@ def error_response(
     return JSONResponse(payload, status_code=status)
 
 
+def public_download_url(url: str) -> str:
+    return url + ("&" if "?" in url else "?") + "download=1"
+
+
+def blob_oidc_credentials(
+    oidc_token: str | None = None,
+) -> tuple[str, str | None]:
+    token = (
+        (oidc_token or "").strip()
+        or os.getenv("VERCEL_OIDC_TOKEN", "").strip()
+    )
+    store_id = os.getenv("BLOB_STORE_ID", "").strip()
+    return token, store_id
+
+
 async def create_gemini_client() -> GeminiClient:
     psid, psidts = get_credentials()
     client = GeminiClient(psid, psidts, proxy=None)
@@ -219,11 +237,7 @@ async def publish_generated_image(
             os.getenv("BLOB_READ_WRITE_TOKEN", "").strip()
             or os.getenv("VERCEL_BLOB_READ_WRITE_TOKEN", "").strip()
         )
-        oidc_token = (
-            (oidc_token or "").strip()
-            or os.getenv("VERCEL_OIDC_TOKEN", "").strip()
-        )
-        store_id = os.getenv("BLOB_STORE_ID", "").strip()
+        oidc_token, store_id = blob_oidc_credentials(oidc_token)
 
         # New Vercel Blob connections use OIDC. The Python Blob SDK version
         # used by this project still follows the read/write-token path, so
@@ -274,12 +288,15 @@ async def publish_generated_image(
 
             uploaded = await asyncio.to_thread(upload_oidc)
 
+            url = uploaded["url"]
             return {
-                "url": uploaded["url"],
+                "url": url,
+                "download_url": public_download_url(url),
                 "title": getattr(image, "title", None),
                 "alt": getattr(image, "alt", None),
                 "type": "generated",
                 "mime_type": content_type,
+                "expires_at": int(time.time()) + MEDIA_TTL_SEC,
             }
 
         # Backwards-compatible path for stores that still provide a token.
@@ -293,12 +310,15 @@ async def publish_generated_image(
                     add_random_suffix=True,
                 )
 
+            url = uploaded.url
             return {
-                "url": uploaded.url,
+                "url": url,
+                "download_url": public_download_url(url),
                 "title": getattr(image, "title", None),
                 "alt": getattr(image, "alt", None),
                 "type": "generated",
                 "mime_type": content_type,
+                "expires_at": int(time.time()) + MEDIA_TTL_SEC,
             }
 
         raise RuntimeError(
@@ -319,6 +339,129 @@ async def publish_generated_image(
             pass
 
         try:
+            Path(tmp_dir).rmdir()
+        except OSError:
+            pass
+
+
+async def publish_generated_video(
+    video: Any,
+    gemini_client: GeminiClient,
+    *,
+    oidc_token: str | None = None,
+) -> dict[str, Any]:
+    """Download a generated Gemini video to temporary storage, upload it to
+    public Vercel Blob, then remove the local temporary copy."""
+    tmp_dir = tempfile.mkdtemp(prefix="gemini-video-")
+    saved_path: Path | None = None
+
+    try:
+        saved = await video.save(
+            path=tmp_dir,
+            verbose=False,
+        )
+        saved_path = Path(saved)
+        raw = saved_path.read_bytes()
+
+        try:
+            saved_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        content_type = mimetypes.guess_type(saved_path.name)[0] or "video/mp4"
+        if not content_type.startswith("video/"):
+            content_type = "video/mp4"
+
+        ext = saved_path.suffix.lower() or ".mp4"
+        pathname = (
+            f"gemini/videos/"
+            f"{time.strftime('%Y/%m/%d')}/"
+            f"video-{int(time.time() * 1000)}{ext}"
+        )
+
+        blob_token = (
+            os.getenv("BLOB_READ_WRITE_TOKEN", "").strip()
+            or os.getenv("VERCEL_BLOB_READ_WRITE_TOKEN", "").strip()
+        )
+        oidc_token, store_id = blob_oidc_credentials(oidc_token)
+
+        if oidc_token and store_id:
+            normalized_store_id = (
+                store_id[len("store_"):]
+                if store_id.startswith("store_")
+                else store_id
+            )
+            query = urlencode({"pathname": pathname})
+            blob_api_url = f"https://vercel.com/api/blob/?{query}"
+            request_id = f"{normalized_store_id}:{time.time_ns()}"
+            headers = {
+                "Authorization": f"Bearer {oidc_token}",
+                "Content-Type": content_type,
+                "x-vercel-blob-store-id": normalized_store_id,
+                "x-api-blob-request-id": request_id,
+                "x-api-blob-request-attempt": "0",
+                "x-api-version": "12",
+                "x-content-length": str(len(raw)),
+            }
+
+            def upload_oidc() -> dict[str, Any]:
+                req = UrlRequest(
+                    blob_api_url,
+                    data=raw,
+                    method="PUT",
+                    headers=headers,
+                )
+                try:
+                    with urlopen(req, timeout=300) as response:
+                        payload = response.read().decode("utf-8")
+                        return json.loads(payload)
+                except HTTPError as exc:
+                    detail = exc.read().decode("utf-8", errors="replace")
+                    raise RuntimeError(
+                        f"Vercel Blob OIDC video upload failed (HTTP {exc.code}): {detail}"
+                    ) from exc
+                except URLError as exc:
+                    raise RuntimeError(
+                        f"Vercel Blob OIDC video upload connection failed: {exc.reason}"
+                    ) from exc
+
+            uploaded = await asyncio.to_thread(upload_oidc)
+            url = uploaded["url"]
+        elif blob_token:
+            async with AsyncBlobClient(token=blob_token) as blob_client:
+                uploaded = await blob_client.put(
+                    pathname,
+                    raw,
+                    access="public",
+                    content_type=content_type,
+                    add_random_suffix=True,
+                )
+            url = uploaded.url
+        else:
+            raise RuntimeError(
+                "Vercel Blob is not configured. Connect the public Blob store "
+                "to this project and redeploy."
+            )
+
+        return {
+            "url": url,
+            "download_url": public_download_url(url),
+            "title": getattr(video, "title", None),
+            "thumbnail": getattr(video, "thumbnail", None),
+            "type": "generated",
+            "mime_type": content_type,
+            "expires_at": int(time.time()) + MEDIA_TTL_SEC,
+        }
+    finally:
+        if saved_path is not None:
+            try:
+                saved_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            for item in Path(tmp_dir).iterdir():
+                if item.is_file():
+                    item.unlink(missing_ok=True)
             Path(tmp_dir).rmdir()
         except OSError:
             pass
@@ -398,33 +541,26 @@ async def website():
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Gemini Image Generator</title>
+<title>Gemini Image + Video Generator</title>
 <style>
-body{margin:0;background:#0b1020;color:#eef3ff;font-family:system-ui,sans-serif}
-main{max-width:1100px;margin:auto;padding:28px}
-h1{margin:0 0 8px}p{color:#9eabc5}
-.grid{display:grid;grid-template-columns:360px 1fr;gap:18px}
-.card{background:#121a2d;border:1px solid #293650;border-radius:16px;padding:18px}
-textarea,input,button{font:inherit}
-textarea,input{width:100%;box-sizing:border-box;background:#0b1220;color:#eef3ff;border:1px solid #33415f;border-radius:10px;padding:11px;margin:6px 0 14px}
-textarea{min-height:150px;resize:vertical}
-.row{display:flex;gap:8px}
-button{border:0;border-radius:10px;padding:11px 15px;font-weight:700;cursor:pointer}
-#go{background:#5e87ff;color:white;flex:1}#stop{background:#25324d;color:white}
-button:disabled{opacity:.5}
-.preview{min-height:420px;background:#080e1a;border:1px dashed #33415f;border-radius:12px;display:flex;align-items:center;justify-content:center;overflow:hidden}
-#image{max-width:100%;max-height:650px;display:none}
-.status{font-size:13px;color:#9eabc5;margin-top:12px}.err{color:#ff9a9a}.ok{color:#8ee0a2}
-small{color:#71809a}
-pre{background:#080e1a;border:1px solid #293650;border-radius:12px;padding:12px;overflow:auto;max-height:380px;white-space:pre-wrap;word-break:break-word;font-size:12px}
-a{color:#9dbbff;word-break:break-all}
-@media(max-width:800px){.grid{grid-template-columns:1fr}main{padding:18px}.preview{min-height:320px}}
+*{box-sizing:border-box}body{margin:0;background:#080c16;color:#edf2ff;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+main{max-width:1180px;margin:auto;padding:28px}.top{margin-bottom:18px}.top h1{margin:0;font-size:30px}.top p{margin:7px 0 0;color:#8e9ab5}
+.tabs{display:flex;gap:8px;margin:16px 0}.tab{padding:10px 18px;border:1px solid #293650;background:#11182a;color:#aeb9d2;border-radius:10px;font-weight:700;cursor:pointer}.tab.active{background:#5d85ff;color:white;border-color:#5d85ff}
+.grid{display:grid;grid-template-columns:360px 1fr;gap:18px}.card{background:#10172a;border:1px solid #27344f;border-radius:16px;padding:18px}
+label{display:block;margin:0 0 6px;font-size:13px;color:#aab5cb}textarea,input{width:100%;background:#090f1c;color:#edf2ff;border:1px solid #31405d;border-radius:10px;padding:11px;margin-bottom:14px;font:inherit}
+textarea{min-height:160px;resize:vertical}.row{display:flex;gap:8px}.btn{border:0;border-radius:10px;padding:11px 15px;font-weight:800;cursor:pointer}.primary{background:#5d85ff;color:#fff;flex:1}.secondary{background:#25324b;color:#fff}.btn:disabled{opacity:.5;cursor:not-allowed}
+.preview{min-height:460px;border:1px dashed #33415e;background:#070c16;border-radius:12px;display:flex;align-items:center;justify-content:center;overflow:hidden}.media{display:none;max-width:100%;max-height:680px}.video{width:100%;max-height:680px}.meta{margin-top:12px;padding:12px;background:#0b1120;border:1px solid #26334d;border-radius:10px}.meta a{color:#9eb9ff;word-break:break-all}.download{display:inline-block;margin-top:10px;background:#38a169;color:#fff;text-decoration:none;padding:9px 13px;border-radius:9px;font-weight:800}
+.status{font-size:13px;color:#93a0b9;margin-top:11px}.ok{color:#8be0a1}.err{color:#ff9999}.timer{font-size:12px;color:#77859f;margin-top:6px}
+pre{margin:0;background:#070c16;border:1px solid #27344f;border-radius:11px;padding:12px;min-height:180px;max-height:330px;overflow:auto;white-space:pre-wrap;word-break:break-word;font-size:12px}
+.section-head{display:flex;justify-content:space-between;align-items:center;margin:18px 0 9px}.copy{background:#25324b;color:#fff;border:0;border-radius:8px;padding:7px 10px;cursor:pointer}
+.hint{font-size:12px;color:#71809a;margin-top:6px}.hidden{display:none}
+@media(max-width:820px){.grid{grid-template-columns:1fr}main{padding:16px}.preview{min-height:320px}}
 </style>
 </head>
 <body>
 <main>
-<h1>Gemini Image Generator</h1>
-<p>Generate through your Gemini Web session. The page keeps the request open while Gemini is working and shows the exact JSON response.</p>
+<div class="top"><h1>Gemini Image + Video Generator</h1><p>Gemini Web cookies on the server. Generated media is stored in public Vercel Blob and automatically deleted after 5 minutes.</p></div>
+<div class="tabs"><button class="tab active" data-kind="image">Image</button><button class="tab" data-kind="video">Video</button></div>
 <div class="grid">
 <section class="card">
 <label>Prompt</label>
@@ -432,48 +568,47 @@ a{color:#9dbbff;word-break:break-all}
 <label>Model (optional)</label>
 <input id="model" placeholder="Leave empty for default">
 <label>API key (optional)</label>
-<input id="key" type="password" placeholder="Only if API_KEYS is configured">
-<label><input id="full" type="checkbox" style="width:auto;margin-right:6px"> full-size image</label>
-<div class="row">
-<button id="go">Generate</button>
-<button id="stop" disabled>Cancel</button>
-</div>
-<div id="status" class="status">Ready.</div>
-<div id="time"><small>Elapsed: 0s</small></div>
+<input id="key" type="password" placeholder="Only when API_KEYS is configured">
+<div class="hint">Video generation may take longer while Gemini renders the video.</div>
+<div class="row" style="margin-top:15px"><button id="go" class="btn primary">Generate Image</button><button id="stop" class="btn secondary" disabled>Cancel</button></div>
+<div id="status" class="status">Ready.</div><div id="timer" class="timer">Elapsed: 0s</div><div id="ttl" class="timer"></div>
 </section>
 <section class="card">
-<div class="preview"><div id="empty"><small>No image yet</small></div><img id="image"></div>
-<div id="link" style="display:none;margin-top:12px"><small>Direct public image URL</small><br><a id="url" target="_blank" rel="noopener"></a></div>
-<div style="display:flex;justify-content:space-between;align-items:center;margin:18px 0 8px"><b>JSON response</b><button id="copy" style="padding:7px 10px;background:#25324d;color:white">Copy JSON</button></div>
+<div class="preview"><div id="empty" class="hint">No media yet</div><img id="image" class="media" alt="Generated image"><video id="video" class="media video" controls playsinline></video></div>
+<div id="meta" class="meta hidden"><div class="hint">Direct public URL</div><a id="url" target="_blank" rel="noopener"></a><br><a id="download" class="download" target="_blank" rel="noopener">Download</a></div>
+<div class="section-head"><b>JSON response</b><button id="copy" class="copy">Copy JSON</button></div>
 <pre id="json">{}</pre>
 </section>
 </div>
 </main>
 <script>
-const $=id=>document.getElementById(id);
-let ctl=null,timer=null,start=0,last={};
+const $=id=>document.getElementById(id);let kind="image",ctl=null,timerId=null,ttlId=null,last={},expiry=0;
 function status(t,c=""){$("status").textContent=t;$("status").className="status "+c}
 function show(o){last=o;$("json").textContent=JSON.stringify(o,null,2)}
-function tick(){start=Date.now();clearInterval(timer);timer=setInterval(()=>{$("time").innerHTML="<small>Elapsed: "+Math.floor((Date.now()-start)/1000)+"s</small>"},1000)}
-function stopTick(){clearInterval(timer);timer=null}
+function elapsed(){const started=Date.now();clearInterval(timerId);timerId=setInterval(()=>$("timer").textContent="Elapsed: "+Math.floor((Date.now()-started)/1000)+"s",1000)}
+function stopClock(){clearInterval(timerId);timerId=null}
+function clearTTL(){clearInterval(ttlId);ttlId=null;$("ttl").textContent=""}
+function setTTL(ts){expiry=ts*1000;clearTTL();const tick=()=>{const left=Math.max(0,expiry-Date.now());const s=Math.floor(left/1000);if(s<=0){$("ttl").textContent="Media expired — cleanup is scheduled.";clearTTL();$("download").removeAttribute("href");return}$("ttl").textContent="Available for download for about "+Math.ceil(s/60)+" min ("+s+"s)"};tick();ttlId=setInterval(tick,1000)}
+function resetOutput(){$("image").style.display="none";$("video").style.display="none";$("empty").style.display="block";$("meta").classList.add("hidden");clearTTL()}
+function setKind(k){kind=k;$("go").textContent=k==="image"?"Generate Image":"Generate Video";$("prompt").placeholder=k==="image"?"A cinematic futuristic Kerala city at sunset":"A short cinematic video of waves on a tropical beach at sunset";resetOutput()}
+document.querySelectorAll(".tab").forEach(b=>b.onclick=()=>{document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));b.classList.add("active");setKind(b.dataset.kind)});
 $("go").onclick=async()=>{
-  const prompt=$("prompt").value.trim();
-  if(!prompt){status("Enter a prompt.","err");return}
-  ctl=new AbortController();$("go").disabled=true;$("stop").disabled=false;
-  $("image").style.display="none";$("empty").style.display="block";$("link").style.display="none";show({});
-  status("Generating… this can take more than 30 seconds.");tick();
-  const headers={"Content-Type":"application/json"};
-  if($("key").value.trim())headers.Authorization="Bearer "+$("key").value.trim();
-  const body={prompt};if($("model").value.trim())body.model=$("model").value.trim();if($("full").checked)body.full_size=true;
-  try{
-    const r=await fetch("/v1/images/generations",{method:"POST",headers,body:JSON.stringify(body),signal:ctl.signal});
-    const txt=await r.text();let data;try{data=JSON.parse(txt)}catch{data={raw:txt}}show(data);
-    if(!r.ok)throw new Error(data?.error?.message||("HTTP "+r.status));
-    const imageUrl=data?.data?.[0]?.url;if(!imageUrl)throw new Error("No image URL returned.");
-    $("image").src=imageUrl;$("image").style.display="block";$("empty").style.display="none";
-    $("url").href=imageUrl;$("url").textContent=imageUrl;$("link").style.display="block";status("Done.","ok");
-  }catch(e){if(e.name==="AbortError")status("Cancelled.");else status(e.message||"Generation failed.","err")}
-  finally{$("go").disabled=false;$("stop").disabled=true;ctl=null;stopTick()}
+ const prompt=$("prompt").value.trim();if(!prompt){status("Enter a prompt.","err");return}
+ ctl=new AbortController();$("go").disabled=true;$("stop").disabled=false;resetOutput();show({});status("Generating…");elapsed();
+ const headers={"Content-Type":"application/json"};if($("key").value.trim())headers.Authorization="Bearer "+$("key").value.trim();
+ const body={prompt};if($("model").value.trim())body.model=$("model").value.trim();
+ const endpoint=kind==="image"?"/v1/images/generations":"/v1/videos/generations";
+ try{
+   const r=await fetch(endpoint,{method:"POST",headers,body:JSON.stringify(body),signal:ctl.signal});
+   const txt=await r.text();let data;try{data=JSON.parse(txt)}catch{data={raw:txt}}show(data);
+   if(!r.ok)throw new Error(data?.error?.message||("HTTP "+r.status));
+   const item=data?.data?.[0];if(!item?.url)throw new Error("No media URL returned.");
+   const mediaUrl=item.url;const downloadUrl=item.download_url||mediaUrl+"?download=1";
+   if(kind==="image"){$("image").src=mediaUrl;$("image").style.display="block";}else{$("video").src=mediaUrl;$("video").style.display="block";}
+   $("empty").style.display="none";$("url").href=mediaUrl;$("url").textContent=mediaUrl;$("download").href=downloadUrl;$("meta").classList.remove("hidden");
+   if(item.expires_at)setTTL(item.expires_at);status("Done.","ok");
+ }catch(e){if(e.name==="AbortError")status("Cancelled.");else status(e.message||"Generation failed.","err")}
+ finally{$("go").disabled=false;$("stop").disabled=true;ctl=null;stopClock()}
 };
 $("stop").onclick=()=>{if(ctl)ctl.abort()};
 $("copy").onclick=async()=>{try{await navigator.clipboard.writeText(JSON.stringify(last,null,2));$("copy").textContent="Copied";setTimeout(()=>$("copy").textContent="Copy JSON",1000)}catch{}};
@@ -494,6 +629,7 @@ async def health() -> dict[str, Any]:
         "auth": "gemini-web-cookie",
         "version": APP_VERSION,
         "image_delivery": "public-vercel-blob",
+        "media_ttl_seconds": MEDIA_TTL_SEC,
     }
 
 
@@ -596,7 +732,8 @@ async def generate_image(request: Request):
             "text": response.text or "",
             "note": (
                 "The returned url is a public Vercel Blob URL. Put it "
-                "directly in an HTML img src; no proxy API or base64 is needed."
+                "directly in an HTML img src; no proxy API or base64 is needed. "
+                "The blob is scheduled for automatic deletion after 5 minutes."
             ),
         }
 
@@ -630,57 +767,51 @@ async def generate_video(request: Request):
 
     body = await request_json(request)
     if body is None:
-        return error_response(
-            400,
-            "invalid JSON body",
-            "invalid_request_error",
-        )
+        return error_response(400, "invalid JSON body", "invalid_request_error")
 
     prompt = body.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
-        return error_response(
-            400,
-            "prompt is required",
-            "invalid_request_error",
-        )
+        return error_response(400, "prompt is required", "invalid_request_error")
 
     model = body.get("model")
     if model is not None and not isinstance(model, str):
-        return error_response(
-            400,
-            "model must be a string",
-            "invalid_request_error",
-        )
+        return error_response(400, "model must be a string", "invalid_request_error")
 
     try:
         client = await create_gemini_client()
         try:
+            generation_prompt = (
+                "Generate a short video for this request using Gemini's "
+                "video generation capability.\n\n"
+                + prompt.strip()
+            )
+
             if model:
                 response = await client.generate_content(
-                    "Generate a short video for this request using Gemini's "
-                    "video generation capability.\n\n"
-                    + prompt.strip(),
+                    generation_prompt,
                     model=model,
                 )
             else:
-                response = await client.generate_content(
-                    "Generate a short video for this request using Gemini's "
-                    "video generation capability.\n\n"
-                    + prompt.strip()
-                )
+                response = await client.generate_content(generation_prompt)
 
-            videos = [
-                media_dict(video, "video")
-                for video in (response.videos or [])
-                if getattr(video, "url", None)
-            ]
+            videos = []
+            for video in response.videos or []:
+                if not getattr(video, "url", None):
+                    continue
+                videos.append(
+                    await publish_generated_video(
+                        video,
+                        client,
+                        oidc_token=request.headers.get("x-vercel-oidc-token"),
+                    )
+                )
 
             if not videos:
                 return error_response(
                     502,
                     "Gemini completed the request but returned no generated "
-                    "video. The account or selected model may not have video "
-                    "generation access.",
+                    "video. Your Gemini account or selected model may not have "
+                    "video generation access.",
                     "no_video_generated",
                 )
 
@@ -690,8 +821,11 @@ async def generate_video(request: Request):
                 "model": model or "unspecified",
                 "data": videos,
                 "text": response.text or "",
+                "note": (
+                    "The returned URL is a public Vercel Blob URL and is scheduled "
+                    "for automatic deletion after 5 minutes."
+                ),
             }
-
         finally:
             await client.close()
 
@@ -708,3 +842,175 @@ async def generate_video(request: Request):
             f"Gemini video generation failed: {exc}",
             "upstream_error",
         )
+
+
+async def _list_and_delete_expired_blobs(
+    oidc_token: str | None,
+) -> dict[str, Any]:
+    blob_token = (
+        os.getenv("BLOB_READ_WRITE_TOKEN", "").strip()
+        or os.getenv("VERCEL_BLOB_READ_WRITE_TOKEN", "").strip()
+    )
+    oidc_token, store_id = blob_oidc_credentials(oidc_token)
+
+    deleted = 0
+    scanned = 0
+    now = time.time()
+
+    if oidc_token and store_id:
+        normalized_store_id = (
+            store_id[len("store_"):]
+            if store_id.startswith("store_")
+            else store_id
+        )
+        cursor: str | None = None
+
+        while True:
+            params: dict[str, str] = {"limit": "1000", "prefix": "gemini/"}
+            if cursor:
+                params["cursor"] = cursor
+            url = "https://vercel.com/api/blob/?" + urlencode(params)
+            headers = {
+                "Authorization": f"Bearer {oidc_token}",
+                "x-vercel-blob-store-id": normalized_store_id,
+                "x-api-blob-request-id": f"{normalized_store_id}:{time.time_ns()}",
+                "x-api-blob-request-attempt": "0",
+                "x-api-version": "12",
+            }
+
+            def fetch_page(page_url: str = url, page_headers: dict[str, str] = headers):
+                req = UrlRequest(page_url, method="GET", headers=page_headers)
+                try:
+                    with urlopen(req, timeout=30) as response:
+                        return json.loads(response.read().decode("utf-8"))
+                except HTTPError as exc:
+                    detail = exc.read().decode("utf-8", errors="replace")
+                    raise RuntimeError(
+                        f"Vercel Blob list failed (HTTP {exc.code}): {detail}"
+                    ) from exc
+                except URLError as exc:
+                    raise RuntimeError(
+                        f"Vercel Blob list connection failed: {exc.reason}"
+                    ) from exc
+
+            page = await asyncio.to_thread(fetch_page)
+            blobs = page.get("blobs", []) if isinstance(page, dict) else []
+
+            expired_urls: list[str] = []
+            for blob in blobs:
+                if not isinstance(blob, dict):
+                    continue
+                scanned += 1
+                uploaded_at = blob.get("uploadedAt") or blob.get("uploaded_at")
+                if not isinstance(uploaded_at, str):
+                    continue
+                try:
+                    dt = datetime.fromisoformat(uploaded_at.replace("Z", "+00:00"))
+                    age = now - dt.timestamp()
+                except ValueError:
+                    continue
+                if age >= MEDIA_TTL_SEC and isinstance(blob.get("url"), str):
+                    expired_urls.append(blob["url"])
+
+            for start in range(0, len(expired_urls), 50):
+                batch = expired_urls[start:start + 50]
+                payload = json.dumps({"urls": batch}).encode("utf-8")
+                delete_url = "https://vercel.com/api/blob/delete"
+                delete_headers = {
+                    "Authorization": f"Bearer {oidc_token}",
+                    "Content-Type": "application/json",
+                    "x-vercel-blob-store-id": normalized_store_id,
+                    "x-api-blob-request-id": f"{normalized_store_id}:{time.time_ns()}",
+                    "x-api-blob-request-attempt": "0",
+                    "x-api-version": "12",
+                }
+
+                def delete_batch(
+                    req_url: str = delete_url,
+                    req_headers: dict[str, str] = delete_headers,
+                    data: bytes = payload,
+                ):
+                    req = UrlRequest(
+                        req_url,
+                        data=data,
+                        method="POST",
+                        headers=req_headers,
+                    )
+                    try:
+                        with urlopen(req, timeout=30) as response:
+                            response.read()
+                    except HTTPError as exc:
+                        detail = exc.read().decode("utf-8", errors="replace")
+                        raise RuntimeError(
+                            f"Vercel Blob delete failed (HTTP {exc.code}): {detail}"
+                        ) from exc
+                    except URLError as exc:
+                        raise RuntimeError(
+                            f"Vercel Blob delete connection failed: {exc.reason}"
+                        ) from exc
+
+                await asyncio.to_thread(delete_batch)
+                deleted += len(batch)
+
+            if not page.get("hasMore") or not page.get("cursor"):
+                break
+            cursor = str(page["cursor"])
+
+    elif blob_token:
+        async with AsyncBlobClient(token=blob_token) as blob_client:
+            cursor: str | None = None
+            while True:
+                listing = await blob_client.list_objects(
+                    prefix="gemini/",
+                    limit=1000,
+                    cursor=cursor,
+                )
+                expired = []
+                for blob in listing.blobs:
+                    scanned += 1
+                    uploaded_at = getattr(blob, "uploaded_at", None)
+                    if uploaded_at is None:
+                        continue
+                    age = now - uploaded_at.timestamp()
+                    if age >= MEDIA_TTL_SEC:
+                        expired.append(blob.url)
+                if expired:
+                    await blob_client.delete(expired)
+                    deleted += len(expired)
+                if not getattr(listing, "has_more", False):
+                    break
+                cursor = getattr(listing, "cursor", None)
+                if not cursor:
+                    break
+    else:
+        raise RuntimeError(
+            "Vercel Blob credentials are unavailable to the cleanup job. "
+            "Reconnect the Blob store or configure BLOB_READ_WRITE_TOKEN."
+        )
+
+    return {
+        "status": "ok",
+        "scanned": scanned,
+        "deleted": deleted,
+        "ttl_seconds": MEDIA_TTL_SEC,
+    }
+
+
+@app.get("/api/cron/cleanup")
+async def cleanup_expired_media(request: Request):
+    cron_secret = os.getenv("CRON_SECRET", "").strip()
+    auth_header = request.headers.get("authorization", "")
+    if not cron_secret or auth_header != f"Bearer {cron_secret}":
+        return error_response(401, "invalid cron authorization", "unauthorized")
+
+    try:
+        result = await _list_and_delete_expired_blobs(
+            request.headers.get("x-vercel-oidc-token")
+        )
+        return result
+    except RuntimeError as exc:
+        return error_response(503, str(exc), "configuration_error")
+    except Exception as exc:
+        LOG.exception("Media cleanup failed")
+        return error_response(502, f"Media cleanup failed: {exc}", "cleanup_error")
+
