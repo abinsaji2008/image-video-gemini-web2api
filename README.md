@@ -1,101 +1,136 @@
 # image-video-gemini-web2api
 
-Vercel-ready API wrapper for Google's Gemini image generation and Veo video generation APIs.
+A Vercel wrapper around the reverse-engineered `gemini-webapi` client, using your existing **Gemini Web session cookies** instead of a Google Gemini API key.
 
-## Endpoints
+The underlying client documents image generation and video generation through the Gemini web app. It uses browser-session authentication and is not an official Google API. citeturn230142search1
 
-- GET / — health check
-- GET /v1/models — image/video model list
-- POST /v1/images/generations — image generation
-- POST /v1/videos/generations — start video generation
-- GET /v1/videos/generations?operation=... — poll a video job
+## Authentication
+
+Set a Vercel environment variable:
+
+```text
+GEMINI_COOKIE=__Secure-1PSID=YOUR_VALUE; __Secure-1PSIDTS=YOUR_VALUE
+```
+
+You may also use:
+
+```text
+GEMINI_1PSID=YOUR_VALUE
+GEMINI_1PSIDTS=YOUR_VALUE
+```
+
+Do **not** commit cookies to GitHub. They are account credentials.
+
+The cookie used by this project must contain the Gemini Web session cookie `__Secure-1PSID`; `__Secure-1PSIDTS` is optional but recommended by the underlying client. citeturn386188search0turn230142search1
 
 ## Deploy to Vercel
 
 1. Import this GitHub repository into Vercel.
-2. Add the environment variable:
+2. Open **Settings → Environment Variables**.
+3. Add `GEMINI_COOKIE`.
+4. Paste your own Gemini Web cookie value.
+5. Deploy/redeploy.
 
-~~~text
-GEMINI_API_KEY=YOUR_GOOGLE_GEMINI_API_KEY
-~~~
+Optional: set `API_KEYS` to protect your Vercel endpoint with Bearer authentication.
 
-3. Optional API protection:
+```text
+API_KEYS=my-private-key
+```
 
-~~~text
-API_KEYS=your-private-api-key
-~~~
+Then send:
 
-When API_KEYS is configured, send Authorization: Bearer your-private-api-key.
+```http
+Authorization: Bearer my-private-key
+```
 
-## Postman: Image
+## Test
 
-POST https://YOUR-PROJECT.vercel.app/v1/images/generations
+Health:
+
+```http
+GET https://YOUR-PROJECT.vercel.app/
+```
+
+Models:
+
+```http
+GET https://YOUR-PROJECT.vercel.app/v1/models
+```
+
+## Postman — Image
+
+**POST**
+
+```text
+https://YOUR-PROJECT.vercel.app/v1/images/generations
+```
 
 Headers:
-~~~text
+
+```text
 Content-Type: application/json
-Authorization: Bearer your-private-api-key
-~~~
+Authorization: Bearer my-private-key
+```
 
 Body:
-~~~json
+
+```json
 {
-  "model": "gemini-3.1-flash-image",
-  "prompt": "A cinematic futuristic Kerala village at sunset, ultra detailed",
-  "aspect_ratio": "16:9",
-  "image_size": "1K"
+  "model": "gemini-flash",
+  "prompt": "Generate a cinematic futuristic Kerala city at sunset."
 }
-~~~
+```
 
-The response contains the generated image as a base64-encoded b64_json field.
+The response returns Gemini-generated image objects with URLs and metadata. The underlying library also supports saving generated images with authenticated downloads. citeturn230142search1
 
-## Postman: Video
+## Postman — Video
 
-POST https://YOUR-PROJECT.vercel.app/v1/videos/generations
+**POST**
+
+```text
+https://YOUR-PROJECT.vercel.app/v1/videos/generations
+```
 
 Body:
-~~~json
+
+```json
 {
-  "model": "veo-3.1-generate-preview",
-  "prompt": "A cinematic drone shot of a tropical beach at sunset, waves moving naturally, realistic lighting",
-  "aspect_ratio": "16:9",
-  "resolution": "1080p"
+  "model": "gemini-pro",
+  "prompt": "Generate a short cinematic video of waves on a tropical beach at sunset."
 }
-~~~
+```
 
-Video generation is asynchronous. The response returns an operation name. Poll it with:
+The response returns generated video metadata/URL when Gemini returns a generated video. The underlying library documents generated video objects and automatic polling when saving/downloading a rendered video. citeturn230142search1
 
-GET https://YOUR-PROJECT.vercel.app/v1/videos/generations?operation=YOUR_OPERATION
+## What this project uses
 
-## Image-to-video
+```text
+Your app / Postman
+        ↓
+Vercel
+        ↓
+Gemini Web session cookie
+        ↓
+Gemini Web internal service
+        ↓
+Image / Video generation
+```
 
-The video endpoint accepts a starting image using image_base64 and image_mime_type.
+No `GEMINI_API_KEY` is used by this project.
 
-~~~json
-{
-  "model": "veo-3.1-generate-preview",
-  "prompt": "The camera slowly moves forward while the subject smiles naturally",
-  "image_base64": "BASE64_IMAGE_DATA",
-  "image_mime_type": "image/png",
-  "aspect_ratio": "16:9",
-  "resolution": "1080p"
-}
-~~~
+## Important limitations
 
-## Models
+This relies on reverse-engineered Gemini Web internals rather than an official Google API, so Google can change those internals and break compatibility. Account, region, language, age, and subscription restrictions can also affect whether image/video generation is available. citeturn230142search1
 
-- gemini-3.1-flash-image
-- gemini-3-pro-image
-- gemini-3.1-flash-lite-image
-- veo-3.1-generate-preview
-
-Model availability, access, quotas, and billing depend on the Google Gemini API key used by the deployment.
+The upstream `gemini-webapi` package currently requires Python 3.11+ and version 2.1.1 is the latest release listed by PyPI. citeturn386188search0
 
 ## Security
 
-Never commit GEMINI_API_KEY or API_KEYS to GitHub. Store secrets in Vercel Environment Variables.
+Never put your Gemini cookies in:
+- GitHub source code
+- README files
+- Postman public collections
+- GitHub Issues
+- public logs
 
-## Official documentation
-
-- https://ai.google.dev/gemini-api/docs/image-generation
-- https://ai.google.dev/gemini-api/docs/veo
+Store them only as Vercel Environment Variables or another secret store.
