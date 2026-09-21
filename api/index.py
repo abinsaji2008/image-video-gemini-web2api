@@ -1,8 +1,9 @@
 import asyncio
 import json
 import os
-from urllib.parse import urlparse
+import time
 from http.server import BaseHTTPRequestHandler
+from urllib.parse import urlparse
 
 from gemini_webapi import GeminiClient
 
@@ -13,18 +14,17 @@ _COOKIE = None
 
 
 def parse_cookie(value: str):
-    """Accept a cookie header, JSON cookie object, or simple key=value list."""
+    """Parse a cookie header, JSON cookie export, or key=value list."""
     if not value:
         return None, None
 
     value = value.strip()
 
-    # JSON formats commonly used by cookie exporters.
     if value.startswith("{"):
         try:
             obj = json.loads(value)
             if isinstance(obj, dict):
-                if "cookie" in obj and isinstance(obj["cookie"], str):
+                if isinstance(obj.get("cookie"), str):
                     value = obj["cookie"]
                 else:
                     return (
@@ -53,18 +53,16 @@ def get_credentials():
     if _COOKIE is not None:
         return _COOKIE
 
-    # Preferred: full browser cookie string in one Vercel variable.
     cookie = os.getenv("GEMINI_COOKIE", "").strip()
     psid, psidts = parse_cookie(cookie)
 
-    # Optional direct variables.
     psid = psid or os.getenv("GEMINI_1PSID", "").strip()
     psidts = psidts or os.getenv("GEMINI_1PSIDTS", "").strip()
 
     if not psid:
         raise RuntimeError(
-            "Missing Gemini cookie. Set GEMINI_COOKIE with your __Secure-1PSID "
-            "(and optionally __Secure-1PSIDTS), or set GEMINI_1PSID."
+            "Missing Gemini cookie. Set GEMINI_COOKIE with __Secure-1PSID "
+            "(and optionally __Secure-1PSIDTS)."
         )
 
     _COOKIE = (psid, psidts)
@@ -92,51 +90,57 @@ async def make_client():
     return client
 
 
-async def generate(prompt, model_name=None, files=None):
+async def generate(prompt, model_name=None):
     client = await make_client()
     try:
-        model = None
+        selected_model = None
         requested = (model_name or os.getenv("GEMINI_MODEL", "")).strip()
+
         if requested:
             try:
-                model = client.resolve_model(requested)
+                selected_model = client.resolve_model(requested)
             except Exception:
-                model = None
+                selected_model = None
 
         return await client.generate_content(
             prompt,
-            files=files,
-            model=model,
+            model=selected_model,
         )
     finally:
         await client.close()
 
 
 def response_to_dict(response):
-    text = response.text or ""
-    images = []
-    for image in response.images or []:
-        images.append({
-            "url": image.url,
-            "title": image.title,
-            "alt": image.alt,
-            "type": "generated" if image.__class__.__name__ == "GeneratedImage" else "web",
-        })
-
-    videos = []
-    for video in response.videos or []:
-        videos.append({
-            "url": video.url,
-            "title": video.title,
-            "thumbnail": getattr(video, "thumbnail", None),
-        })
-
-    return {
-        "text": text,
-        "images": images,
-        "videos": videos,
-        "model": str(getattr(response, "model", "") or ""),
+    result = {
+        "text": response.text or "",
+        "images": [],
+        "videos": [],
     }
+
+    for image in response.images or []:
+        result["images"].append(
+            {
+                "url": image.url,
+                "title": image.title,
+                "alt": image.alt,
+                "type": (
+                    "generated"
+                    if image.__class__.__name__ == "GeneratedImage"
+                    else "web"
+                ),
+            }
+        )
+
+    for video in response.videos or []:
+        result["videos"].append(
+            {
+                "url": video.url,
+                "title": video.title,
+                "thumbnail": getattr(video, "thumbnail", None),
+            }
+        )
+
+    return result
 
 
 def run(coro):
@@ -158,88 +162,131 @@ class handler(BaseHTTPRequestHandler):
     def read_json(self):
         try:
             length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0:
+                return None
             return json.loads(self.rfile.read(length).decode("utf-8"))
         except Exception:
             return None
+
+    def require_auth(self):
+        if api_authorized(self.headers):
+            return True
+        self.send_json(401, {"error": {"message": "invalid API key"}})
+        return False
 
     def do_OPTIONS(self):
         self.send_json(204, {})
 
     def do_GET(self):
-        if not api_authorized(self.headers):
-            return self.send_json(401, {"error": {"message": "invalid API key"}})
+        if not self.require_auth():
+            return
 
         parsed = urlparse(self.path)
+
         if parsed.path == "/":
-            return self.send_json(200, {
-                "status": "ok",
-                "service": "image-video-gemini-web2api",
-                "auth": "gemini-web-cookie",
-            })
+            self.send_json(
+                200,
+                {
+                    "status": "ok",
+                    "service": "image-video-gemini-web2api",
+                    "auth": "gemini-web-cookie",
+                },
+            )
+            return
 
         if parsed.path == "/v1/models":
-            return self.send_json(200, {
-                "object": "list",
-                "data": [
-                    {"id": "gemini-flash", "object": "model", "owned_by": "google-web"},
-                    {"id": "gemini-pro", "object": "model", "owned_by": "google-web"},
-                ],
-            })
+            self.send_json(
+                200,
+                {
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "gemini-flash",
+                            "object": "model",
+                            "owned_by": "google-web",
+                        },
+                        {
+                            "id": "gemini-pro",
+                            "object": "model",
+                            "owned_by": "google-web",
+                        },
+                    ],
+                },
+            )
+            return
 
-        return self.send_json(404, {"error": {"message": "not found"}})
+        self.send_json(404, {"error": {"message": "not found"}})
 
     def do_POST(self):
-        if not api_authorized(self.headers):
-            return self.send_json(401, {"error": {"message": "invalid API key"}})
+        if not self.require_auth():
+            return
 
         parsed = urlparse(self.path)
         body = self.read_json()
+
         if body is None:
-            return self.send_json(400, {"error": {"message": "invalid JSON body"}})
+            self.send_json(400, {"error": {"message": "invalid JSON body"}})
+            return
 
         try:
             if parsed.path == "/v1/images/generations":
                 prompt = body.get("prompt")
                 if not isinstance(prompt, str) or not prompt.strip():
-                    return self.send_json(400, {"error": {"message": "prompt is required"}})
+                    self.send_json(
+                        400, {"error": {"message": "prompt is required"}}
+                    )
+                    return
 
-                response = run(generate(
-                    "Generate an image for this request. Return only the generated image and any brief relevant text.
-
-"
-                    + prompt.strip()
-                ))
+                response = run(
+                    generate(
+                        "Generate an image for this request.\n\n"
+                        + prompt.strip(),
+                        model_name=body.get("model"),
+                    )
+                )
                 data = response_to_dict(response)
 
-                return self.send_json(200, {
-                    "created": int(__import__("time").time()),
-                    "object": "image.generation",
-                    "model": body.get("model") or DEFAULT_IMAGE_MODEL,
-                    "data": data["images"],
-                    "text": data["text"],
-                })
+                self.send_json(
+                    200,
+                    {
+                        "created": int(time.time()),
+                        "object": "image.generation",
+                        "model": body.get("model") or DEFAULT_IMAGE_MODEL,
+                        "data": data["images"],
+                        "text": data["text"],
+                    },
+                )
+                return
 
             if parsed.path == "/v1/videos/generations":
                 prompt = body.get("prompt")
                 if not isinstance(prompt, str) or not prompt.strip():
-                    return self.send_json(400, {"error": {"message": "prompt is required"}})
+                    self.send_json(
+                        400, {"error": {"message": "prompt is required"}}
+                    )
+                    return
 
-                response = run(generate(
-                    "Generate a video for this request. Create a short video using Gemini's video generation capability.
-
-"
-                    + prompt.strip()
-                ))
+                response = run(
+                    generate(
+                        "Generate a video for this request. Create a short video using Gemini's video generation capability.\n\n"
+                        + prompt.strip(),
+                        model_name=body.get("model"),
+                    )
+                )
                 data = response_to_dict(response)
 
-                return self.send_json(200, {
-                    "created": int(__import__("time").time()),
-                    "object": "video.generation",
-                    "model": body.get("model") or DEFAULT_VIDEO_MODEL,
-                    "data": data["videos"],
-                    "text": data["text"],
-                })
+                self.send_json(
+                    200,
+                    {
+                        "created": int(time.time()),
+                        "object": "video.generation",
+                        "model": body.get("model") or DEFAULT_VIDEO_MODEL,
+                        "data": data["videos"],
+                        "text": data["text"],
+                    },
+                )
+                return
 
-            return self.send_json(404, {"error": {"message": "not found"}})
+            self.send_json(404, {"error": {"message": "not found"}})
         except Exception as exc:
-            return self.send_json(500, {"error": {"message": str(exc)}})
+            self.send_json(500, {"error": {"message": str(exc)}})
