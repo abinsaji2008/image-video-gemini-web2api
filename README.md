@@ -220,3 +220,21 @@ Keep these secrets private:
 ## Limitations
 
 This project uses reverse-engineered Gemini Web internals rather than an official Google API, so compatibility can change with the Gemini web application. The underlying library may also be affected by account, region, subscription, or feature availability. citeturn610657view0
+
+## Temporary media and automatic cleanup
+
+Generated images and videos are uploaded to the public Blob store and are marked with a 5 minute TTL. The project runs `/api/cron/cleanup` every minute and removes expired `gemini/` blobs. Vercel documents that Cron Jobs can be configured in `vercel.json` and triggered in production.
+
+Set a production environment variable:
+
+```text
+CRON_SECRET=<long-random-secret>
+```
+
+The cron endpoint accepts only `Authorization: Bearer <CRON_SECRET>`. After setting it, redeploy the project so the cron configuration becomes active.
+
+The website provides an **Image / Video** switch, inline preview, direct public URL, **Download** button, JSON response viewer, elapsed time, and an expiry countdown.
+
+Video generation uses `response.videos` and `video.save()` from the upstream `gemini-webapi` package. Video generation availability depends on the Gemini account/model.
+
+Deletion runs every minute, so the practical deletion point is approximately 5 to 6 minutes after upload. Vercel notes that deleted blobs can remain in the CDN cache for up to about one minute.
