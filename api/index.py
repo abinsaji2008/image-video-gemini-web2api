@@ -1,18 +1,21 @@
 import asyncio
 import json
 import logging
+import mimetypes
 import os
+import tempfile
 import time
+from pathlib import Path
 from typing import Any
-from urllib.parse import quote, unquote, urlparse
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse
 from gemini_webapi import GeminiClient
+from vercel.blob import AsyncBlobClient
 
 LOG = logging.getLogger(__name__)
-APP_VERSION = "3.0-fastapi-cookie"
+APP_VERSION = "4.0-public-blob"
 
 app = FastAPI(
     title="Gemini Web Image/Video API",
@@ -37,14 +40,12 @@ def _cookie_pairs(value: str) -> dict[str, str]:
         if "=" not in part:
             continue
         key, val = part.split("=", 1)
-        key = key.strip()
-        if key:
-            pairs[key] = val.strip()
+        pairs[key.strip()] = val.strip()
     return pairs
 
 
 def parse_cookie(value: str | None) -> tuple[str | None, str | None]:
-    """Accept a Cookie header, a JSON export, or KEY=VALUE pairs."""
+    """Accept a Cookie header, a JSON cookie export, or KEY=VALUE pairs."""
     if not value:
         return None, None
 
@@ -105,13 +106,19 @@ def get_credentials() -> tuple[str, str | None]:
 
 def authorize(request: Request) -> bool:
     configured = [
-        x.strip() for x in os.getenv("API_KEYS", "").split(",") if x.strip()
+        x.strip()
+        for x in os.getenv("API_KEYS", "").split(",")
+        if x.strip()
     ]
     if not configured:
         return True
 
     bearer = request.headers.get("authorization", "")
-    token = bearer[7:].strip() if bearer.lower().startswith("bearer ") else ""
+    token = (
+        bearer[7:].strip()
+        if bearer.lower().startswith("bearer ")
+        else ""
+    )
     token = token or request.headers.get("x-api-key", "").strip()
     return token in configured
 
@@ -125,10 +132,11 @@ def error_response(
     return JSONResponse(payload, status_code=status)
 
 
-async def create_client() -> GeminiClient:
+async def create_gemini_client() -> GeminiClient:
     psid, psidts = get_credentials()
     client = GeminiClient(psid, psidts, proxy=None)
     timeout = float(os.getenv("GEMINI_TIMEOUT_SEC", "240"))
+
     await client.init(
         timeout=timeout,
         auto_close=False,
@@ -137,38 +145,137 @@ async def create_client() -> GeminiClient:
     return client
 
 
-async def generate(prompt: str, model_name: str | None = None):
-    client = await create_client()
+async def generate_with_client(
+    prompt: str,
+    model_name: str | None = None,
+):
+    client = await create_gemini_client()
     try:
-        # gemini-webapi resolves string model names inside generate_content().
         if model_name:
-            return await client.generate_content(prompt, model=model_name)
-        return await client.generate_content(prompt)
-    finally:
+            response = await client.generate_content(
+                prompt,
+                model=model_name,
+            )
+        else:
+            response = await client.generate_content(prompt)
+
+        return client, response
+    except Exception:
         await client.close()
+        raise
 
 
-def make_proxy_url(request: Request, image_url: str) -> str:
-    # Keep the response small: return a short API URL that fetches the image
-    # later through the authenticated Gemini session.
-    base = str(request.base_url).rstrip("/")
-    return f"{base}/api/v1/media/image?url={quote(image_url, safe='')}"
+async def publish_generated_image(
+    image: Any,
+    gemini_client: GeminiClient,
+    *,
+    full_size: bool = False,
+) -> dict[str, Any]:
+    """Download the Gemini image with its authenticated session and publish it
+    as a public Vercel Blob, returning a normal direct URL."""
+    tmp_dir = tempfile.mkdtemp(prefix="gemini-image-")
+    tmp_path = str(Path(tmp_dir) / "generated.png")
 
-
-async def fetch_image_with_gemini_session(image_url: str):
-    client = await create_client()
     try:
-        response = await client.client.get(
-            image_url,
-            headers={
-                "Origin": "https://gemini.google.com",
-                "Referer": "https://gemini.google.com/",
-            },
-            allow_redirects=True,
+        saved_path = await image.save(
+            path=tmp_dir,
+            filename="generated.png",
+            verbose=False,
+            client=gemini_client.client,
+            full_size=full_size,
         )
-        return response.status_code, response.headers, response.content
+
+        file_path = Path(saved_path)
+        raw = file_path.read_bytes()
+
+        content_type = "image/png"
+        detected = mimetypes.guess_type(file_path.name)[0]
+        if detected and detected.startswith("image/"):
+            content_type = detected
+
+        blob_token = os.getenv("BLOB_READ_WRITE_TOKEN", "").strip()
+        if not blob_token:
+            raise RuntimeError(
+                "Vercel Blob is not configured. Create a PUBLIC Vercel "
+                "Blob store and connect it to this project, then redeploy."
+            )
+
+        pathname = (
+            f"gemini/images/"
+            f"{time.strftime('%Y/%m/%d')}/"
+            f"image-{time.time_ns()}.png"
+        )
+
+        async with AsyncBlobClient(token=blob_token) as blob_client:
+            uploaded = await blob_client.put(
+                pathname,
+                raw,
+                access="public",
+                content_type=content_type,
+                add_random_suffix=False,
+            )
+
+        return {
+            "url": uploaded.url,
+            "title": getattr(image, "title", None),
+            "alt": getattr(image, "alt", None),
+            "type": "generated",
+            "mime_type": content_type,
+        }
+
+    finally:
+        try:
+            if Path(tmp_path).exists():
+                Path(tmp_path).unlink()
+        except OSError:
+            pass
+
+        try:
+            Path(tmp_dir).rmdir()
+        except OSError:
+            pass
+
+
+async def generate_and_publish_images(
+    prompt: str,
+    model_name: str | None = None,
+    full_size: bool = False,
+):
+    client = await create_gemini_client()
+    try:
+        if model_name:
+            response = await client.generate_content(
+                prompt,
+                model=model_name,
+            )
+        else:
+            response = await client.generate_content(prompt)
+
+        images: list[dict[str, Any]] = []
+        for image in response.images or []:
+            if not getattr(image, "url", None):
+                continue
+
+            images.append(
+                await publish_generated_image(
+                    image,
+                    client,
+                    full_size=full_size,
+                )
+            )
+
+        return response, images
     finally:
         await client.close()
+
+
+async def request_json(request: Request) -> dict[str, Any] | None:
+    try:
+        body = await request.json()
+    except Exception:
+        return None
+
+    return body if isinstance(body, dict) else None
 
 
 def media_dict(obj: Any, kind: str) -> dict[str, Any]:
@@ -192,14 +299,6 @@ def media_dict(obj: Any, kind: str) -> dict[str, Any]:
     }
 
 
-async def request_json(request: Request) -> dict[str, Any] | None:
-    try:
-        body = await request.json()
-    except Exception:
-        return None
-    return body if isinstance(body, dict) else None
-
-
 @app.get("/api")
 @app.get("/api/")
 @app.get("/api/health")
@@ -209,6 +308,7 @@ async def health() -> dict[str, Any]:
         "service": "image-video-gemini-web2api",
         "auth": "gemini-web-cookie",
         "version": APP_VERSION,
+        "image_delivery": "public-vercel-blob",
     }
 
 
@@ -218,7 +318,7 @@ async def models(request: Request):
         return error_response(401, "invalid API key", "invalid_api_key")
 
     try:
-        client = await create_client()
+        client = await create_gemini_client()
         try:
             available = client.list_models() or []
             data = []
@@ -261,48 +361,39 @@ async def generate_image(request: Request):
     body = await request_json(request)
     if body is None:
         return error_response(
-            400, "invalid JSON body", "invalid_request_error"
+            400,
+            "invalid JSON body",
+            "invalid_request_error",
         )
 
     prompt = body.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         return error_response(
-            400, "prompt is required", "invalid_request_error"
+            400,
+            "prompt is required",
+            "invalid_request_error",
         )
 
     model = body.get("model")
     if model is not None and not isinstance(model, str):
         return error_response(
-            400, "model must be a string", "invalid_request_error"
+            400,
+            "model must be a string",
+            "invalid_request_error",
         )
 
+    # Default to preview-size download for speed. Set full_size=true when
+    # the larger generated image is required.
+    full_size = bool(body.get("full_size", False))
+
     try:
-        response = await generate(
+        response, images = await generate_and_publish_images(
             "Generate an image for this request. Return the generated image, "
             "not a web image.\n\n"
             + prompt.strip(),
             model_name=model,
+            full_size=full_size,
         )
-
-        images = []
-        for image in response.images or []:
-            url = getattr(image, "url", None)
-            if not url:
-                continue
-
-            images.append(
-                {
-                    "url": url,
-                    "proxy_url": make_proxy_url(request, url),
-                    "title": getattr(image, "title", None),
-                    "alt": getattr(image, "alt", None),
-                    "type": (
-                        "generated"
-                        if image.__class__.__name__ == "GeneratedImage"
-                        else "web"
-                    ),
-                }
-            )
 
         if not images:
             return error_response(
@@ -318,18 +409,25 @@ async def generate_image(request: Request):
             "data": images,
             "text": response.text or "",
             "note": (
-                "Open proxy_url. The proxy fetches the Google-hosted image "
-                "using the authenticated Gemini session, so the large "
-                "base64 payload is no longer returned by this endpoint."
+                "The returned url is a public Vercel Blob URL. Put it "
+                "directly in an HTML img src; no proxy API or base64 is needed."
             ),
         }
 
     except ValueError as exc:
         return error_response(400, str(exc), "invalid_model")
     except asyncio.TimeoutError:
-        return error_response(504, "Gemini request timed out", "timeout")
+        return error_response(
+            504,
+            "Gemini request timed out",
+            "timeout",
+        )
     except RuntimeError as exc:
-        return error_response(503, str(exc), "configuration_error")
+        return error_response(
+            503,
+            str(exc),
+            "configuration_error",
+        )
     except Exception as exc:
         LOG.exception("Image generation failed")
         return error_response(
@@ -339,59 +437,6 @@ async def generate_image(request: Request):
         )
 
 
-@app.get("/api/v1/media/image")
-async def media_image(request: Request):
-    if not authorize(request):
-        return error_response(401, "invalid API key", "invalid_api_key")
-
-    encoded = request.query_params.get("url", "")
-    if not encoded:
-        return error_response(400, "url is required", "invalid_request_error")
-
-    try:
-        image_url = unquote(encoded)
-    except Exception:
-        return error_response(400, "invalid image URL token", "invalid_request_error")
-
-    parsed = urlparse(image_url)
-    if parsed.scheme != "https" or parsed.netloc not in {
-        "lh3.googleusercontent.com",
-        "googleusercontent.com",
-    }:
-        return error_response(400, "invalid Google image URL", "invalid_request_error")
-
-    try:
-        status, headers, content = await fetch_image_with_gemini_session(image_url)
-        if status != 200:
-            return error_response(
-                502,
-                f"Google image server returned HTTP {status}",
-                "media_upstream_error",
-            )
-
-        content_type = headers.get("content-type", "image/png")
-        if not content_type.startswith("image/"):
-            content_type = "image/png"
-
-        return Response(
-            content=content,
-            media_type=content_type,
-            headers={
-                "Cache-Control": "private, max-age=300",
-                "Content-Disposition": "inline",
-            },
-        )
-
-    except asyncio.TimeoutError:
-        return error_response(504, "Image download timed out", "timeout")
-    except Exception as exc:
-        LOG.exception("Image proxy failed")
-        return error_response(
-            502,
-            f"Image proxy failed: {exc}",
-            "media_upstream_error",
-        )
-
 @app.post("/api/v1/videos/generations")
 async def generate_video(request: Request):
     if not authorize(request):
@@ -400,70 +445,69 @@ async def generate_video(request: Request):
     body = await request_json(request)
     if body is None:
         return error_response(
-            400, "invalid JSON body", "invalid_request_error"
+            400,
+            "invalid JSON body",
+            "invalid_request_error",
         )
 
     prompt = body.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         return error_response(
-            400, "prompt is required", "invalid_request_error"
+            400,
+            "prompt is required",
+            "invalid_request_error",
         )
 
     model = body.get("model")
     if model is not None and not isinstance(model, str):
         return error_response(
-            400, "model must be a string", "invalid_request_error"
+            400,
+            "model must be a string",
+            "invalid_request_error",
         )
 
     try:
-        response = await generate(
-            "Generate a short video for this request using Gemini's video "
-            "generation capability.\n\n"
-            + prompt.strip(),
-            model_name=model,
-        )
-
-        videos = [
-            media_dict(video, "video")
-            for video in (response.videos or [])
-            if getattr(video, "url", None)
-        ]
-
-        # Some upstream versions may expose generated video as media.
-        if not videos:
-            for item in getattr(response, "media", None) or []:
-                url = getattr(item, "url", None) or getattr(
-                    item, "mp4_url", None
+        client = await create_gemini_client()
+        try:
+            if model:
+                response = await client.generate_content(
+                    "Generate a short video for this request using Gemini's "
+                    "video generation capability.\n\n"
+                    + prompt.strip(),
+                    model=model,
                 )
-                if url:
-                    videos.append(
-                        {
-                            "url": url,
-                            "title": getattr(item, "title", None),
-                            "thumbnail": (
-                                getattr(item, "thumbnail", None)
-                                or getattr(item, "mp4_thumbnail", None)
-                            ),
-                            "type": item.__class__.__name__,
-                        }
-                    )
+            else:
+                response = await client.generate_content(
+                    "Generate a short video for this request using Gemini's "
+                    "video generation capability.\n\n"
+                    + prompt.strip()
+                )
 
-        if not videos:
-            return error_response(
-                502,
-                "Gemini completed the request but returned no generated "
-                "video. The account or selected model may not have video "
-                "generation access.",
-                "no_video_generated",
-            )
+            videos = [
+                media_dict(video, "video")
+                for video in (response.videos or [])
+                if getattr(video, "url", None)
+            ]
 
-        return {
-            "created": int(time.time()),
-            "object": "video.generation",
-            "model": model or "unspecified",
-            "data": videos,
-            "text": response.text or "",
-        }
+            if not videos:
+                return error_response(
+                    502,
+                    "Gemini completed the request but returned no generated "
+                    "video. The account or selected model may not have video "
+                    "generation access.",
+                    "no_video_generated",
+                )
+
+            return {
+                "created": int(time.time()),
+                "object": "video.generation",
+                "model": model or "unspecified",
+                "data": videos,
+                "text": response.text or "",
+            }
+
+        finally:
+            await client.close()
 
     except ValueError as exc:
         return error_response(400, str(exc), "invalid_model")
