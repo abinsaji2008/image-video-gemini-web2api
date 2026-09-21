@@ -960,59 +960,81 @@ async def generate_image(request: Request):
         return error_response(400, "model must be a string", "invalid_request_error")
 
     full_size = bool(body.get("full_size", False))
+    fallback_enabled = os.getenv("ENABLE_OFFICIAL_IMAGE_FALLBACK", "true").strip().lower() not in {"0", "false", "no", "off"}
+    web_details: dict[str, Any] = {}
 
     try:
         response, images, attempts, generation_error = await generate_and_publish_images(
-            (
-                "Generate an AI image for this request. "
-                "Return the generated image, not a web image or only text.\n\n"
-                + prompt.strip()
-            ),
+            "Generate an AI image for this request. Return the generated image, not a web image or only text.\n\n" + prompt.strip(),
             model_name=model,
             full_size=full_size,
             oidc_token=request.headers.get("x-vercel-oidc-token"),
         )
 
-        if not images:
-            details = {
-                "attempts": attempts,
-                "images_returned": len(response.images or []) if response else 0,
-                "text": response.text or "" if response else "",
-                "check": (
-                    "Use an account with Gemini image generation enabled and "
-                    "do not force a text-only model."
-                ),
+        if images:
+            return {
+                "created": int(time.time()),
+                "object": "image.generation",
+                "model": model or "automatic-web",
+                "data": images,
+                "text": response.text or "",
+                "attempt": attempts,
+                "provider": "gemini-web",
+                "note": "Generated through Gemini Web and stored in public Vercel Blob.",
             }
-            if generation_error:
-                details["last_error"] = str(generation_error)
 
-            return JSONResponse(
-                {
-                    "error": {
-                        "message": (
-                            "Gemini completed the request but exposed no "
-                            "generated image to the WebAPI client."
-                        ),
-                        "type": "no_image_generated",
-                        "retryable": False,
-                    },
-                    "details": details,
-                },
-                status_code=502,
-            )
-
-        return {
-            "created": int(time.time()),
-            "object": "image.generation",
-            "model": model or "automatic",
-            "data": images,
-            "text": response.text or "",
-            "attempt": attempts,
-            "note": (
-                "The returned URL is a public Vercel Blob URL. "
-                "The API uses a 1-hour application retention window; actual Blob deletion follows the configured cleanup cron."
-            ),
+        web_details = {
+            "attempts": attempts,
+            "images_returned": len(response.images or []) if response else 0,
+            "text": response.text or "" if response else "",
         }
+        if generation_error:
+            web_details["last_error"] = str(generation_error)
+
+        text_lower = web_details.get("text", "").lower()
+        denied = any(x in text_lower for x in (
+            "can't create any",
+            "cannot create any",
+            "image creation may not be available",
+            "can't create images",
+            "cannot create images",
+        ))
+
+        if fallback_enabled and denied and get_official_gemini_api_key():
+            try:
+                image = await generate_official_image(
+                    prompt.strip(),
+                    model_name=model,
+                    oidc_token=request.headers.get("x-vercel-oidc-token"),
+                )
+                return {
+                    "created": int(time.time()),
+                    "object": "image.generation",
+                    "model": model or "gemini-3.1-flash-image",
+                    "data": [image],
+                    "text": "",
+                    "provider": "google-gemini-api",
+                    "fallback": {"used": True, "reason": "Gemini Web image creation was unavailable for this session."},
+                }
+            except Exception as official_exc:
+                web_details["official_fallback_error"] = str(official_exc)
+
+        return JSONResponse(
+            {
+                "error": {
+                    "message": "Gemini Web image creation is unavailable for this session.",
+                    "type": "image_generation_unavailable",
+                    "retryable": False,
+                },
+                "details": {
+                    **web_details,
+                    "official_fallback_enabled": fallback_enabled,
+                    "official_api_configured": bool(get_official_gemini_api_key()),
+                    "next_step": "Set GEMINI_API_KEY to a Gemini Developer API key to enable the official image fallback.",
+                },
+            },
+            status_code=502,
+        )
 
     except ValueError as exc:
         return error_response(400, str(exc), "invalid_model")
