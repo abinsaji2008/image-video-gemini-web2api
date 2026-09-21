@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,8 +18,8 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from gemini_webapi import GeminiClient
-from google import genai
-from google.genai import types
+from gemini_webapi.types import GeneratedImage
+from gemini_webapi.utils import get_nested_value
 from vercel.blob import AsyncBlobClient
 
 LOG = logging.getLogger(__name__)
@@ -28,6 +29,14 @@ IMAGE_MAX_ATTEMPTS = max(1, int(os.getenv("GEMINI_IMAGE_MAX_ATTEMPTS", "2")))
 VIDEO_TOTAL_TIMEOUT_SEC = min(300.0, max(60.0, float(os.getenv("GEMINI_VIDEO_MAX_SECONDS", "300"))))
 VIDEO_MAX_ATTEMPTS = max(1, int(os.getenv("GEMINI_VIDEO_MAX_ATTEMPTS", "2")))
 VIDEO_RETRY_MIN_REMAINING_SEC = float(os.getenv("GEMINI_VIDEO_RETRY_MIN_REMAINING_SEC", "180"))
+# Gemini Web's image composer uses a browser-specific StreamGenerate route.
+# These parameters are configurable because Google can rotate the internal model id.
+GEMINI_IMAGE_MODEL_ID = os.getenv("GEMINI_IMAGE_MODEL_ID", "56fdd199312815e2").strip()
+GEMINI_IMAGE_MAX_ATTEMPTS = max(1, int(os.getenv("GEMINI_IMAGE_MAX_ATTEMPTS", "2")))
+GEMINI_IMAGE_REQUEST_TIMEOUT_SEC = float(os.getenv("GEMINI_IMAGE_REQUEST_TIMEOUT_SEC", "300"))
+_IMAGE_PATCH_LOCK = asyncio.Lock()
+_IMAGE_MODE = False
+_IMAGE_PATCHED = False
 
 app = FastAPI(
     title="Gemini Web Image/Video API",
@@ -258,13 +267,259 @@ async def generate_official_image(
                 "alt": "",
                 "type": "generated",
                 "mime_type": mime_type,
-                "provider": "google-gemini-api",
+                "provider": "",
                 "expires_at": int(time.time()) + MEDIA_TTL_SEC,
             }
         response_text = getattr(response, "text", "") or ""
         raise RuntimeError("Official Gemini API returned no image data." + (f" Response: {response_text}" if response_text else ""))
     finally:
         client.close()
+
+
+
+def _patch_image_parser_once() -> None:
+    """Teach gemini-webapi about Gemini's newer sparse image response format."""
+    global _IMAGE_PATCHED
+    if _IMAGE_PATCHED:
+        return
+
+    import gemini_webapi.client as gw_client
+
+    original = gw_client.GeminiClient._parse_candidate
+
+    def patched_parse_candidate(self, candidate_data, cid, rid, rcid):
+        (
+            text,
+            thoughts,
+            web_images,
+            generated_images,
+            generated_videos,
+            generated_media,
+            citations,
+        ) = original(self, candidate_data, cid, rid, rcid)
+
+        # Current Gemini Web can store generated images in sparse field "8"
+        # inside candidate[12][0], instead of the older positional [12][7][0].
+        rich = get_nested_value(candidate_data, [12])
+        if isinstance(rich, list) and rich:
+            first = rich[0]
+            sparse_images = (
+                first.get("8")
+                if isinstance(first, dict)
+                else None
+            )
+            if isinstance(sparse_images, list):
+                existing_urls = {
+                    getattr(image, "url", "")
+                    for image in generated_images
+                }
+
+                for index, image_data in enumerate(sparse_images):
+                    url_parts = get_nested_value(image_data, [0, 0, 3])
+                    if not isinstance(url_parts, list) or len(url_parts) < 4:
+                        continue
+
+                    url = url_parts[3]
+                    if not isinstance(url, str) or not url.startswith("http"):
+                        continue
+                    if url in existing_urls:
+                        continue
+
+                    image_id = (
+                        get_nested_value(image_data, [1, 0])
+                        or f"http://googleusercontent.com/image_generation_content/{index}"
+                    )
+                    title = (
+                        url_parts[2]
+                        if len(url_parts) > 2 and url_parts[2]
+                        else "[Generated Image]"
+                    )
+
+                    generated_images.append(
+                        GeneratedImage(
+                            url=url,
+                            title=str(title),
+                            alt="",
+                            proxy=getattr(self, "proxy", None),
+                            client=getattr(self, "client", None),
+                            client_ref=self,
+                            cid=cid,
+                            rid=rid,
+                            rcid=rcid,
+                            image_id=image_id,
+                        )
+                    )
+                    existing_urls.add(url)
+
+        return (
+            text,
+            thoughts,
+            web_images,
+            generated_images,
+            generated_videos,
+            generated_media,
+            citations,
+        )
+
+    gw_client.GeminiClient._parse_candidate = patched_parse_candidate
+    _IMAGE_PATCHED = True
+
+
+def _patch_image_request(client: GeminiClient) -> None:
+    """Patch StreamGenerate to match the browser's image-generation request."""
+    global _IMAGE_MODE
+
+    http = client.client
+    if getattr(http, "_gemini_image_web2api_patched", False):
+        return
+
+    original_request = http.request
+
+    async def patched_request(method, url, **kwargs):
+        global _IMAGE_MODE
+        if (
+            method == "POST"
+            and "StreamGenerate" in str(url)
+            and _IMAGE_MODE
+        ):
+            headers = dict(kwargs.get("headers") or {})
+            request_uuid = str(uuid.uuid4()).upper()
+
+            # Browser image-generation header shape observed in a current
+            # cookie-only Gemini Web implementation.
+            headers["x-goog-ext-525001261-jspb"] = (
+                '[1,null,null,null,"'
+                + GEMINI_IMAGE_MODEL_ID
+                + '",null,null,0,[4,5,6,8],null,null,2,null,null,1,1,"'
+                + request_uuid
+                + '"]'
+            )
+            headers["x-goog-ext-73010989-jspb"] = "[0]"
+            headers["x-goog-ext-73010990-jspb"] = "[0,0,0]"
+            headers["x-goog-ext-525005358-jspb"] = json.dumps(
+                [request_uuid, 1]
+            )
+            kwargs["headers"] = headers
+
+            data = kwargs.get("data")
+            if isinstance(data, dict) and "f.req" in data:
+                try:
+                    outer = json.loads(data["f.req"])
+                    inner = json.loads(outer[1])
+
+                    browser_params = {
+                        1: [os.getenv("GEMINI_LANGUAGE", "en")],
+                        6: [1],
+                        7: 1,
+                        10: 1,
+                        11: 0,
+                        17: [[1]],
+                        18: 0,
+                        27: 1,
+                        30: [4],
+                        41: [1],
+                        53: 0,
+                        61: [],
+                        68: 2,
+                    }
+
+                    for index, value in browser_params.items():
+                        if index < len(inner):
+                            inner[index] = value
+
+                    # Keep the UUID identical in the body and headers.
+                    if len(inner) > 59:
+                        inner[59] = request_uuid
+
+                    outer[1] = json.dumps(inner)
+                    data["f.req"] = json.dumps(outer)
+                    kwargs["data"] = data
+                except Exception:
+                    LOG.exception("Failed to patch Gemini image request body")
+
+        return await original_request(method, url, **kwargs)
+
+    http.request = patched_request
+    setattr(http, "_gemini_image_web2api_patched", True)
+
+
+async def _generate_web_image(
+    prompt: str,
+    model_name: str | None = None,
+    *,
+    full_size: bool = False,
+    oidc_token: str | None = None,
+):
+    """Generate image using Gemini Web only; no API key is used."""
+    _patch_image_parser_once()
+    client = None
+
+    async with _IMAGE_PATCH_LOCK:
+        _IMAGE_MODE = True
+        try:
+            last_response = None
+            last_images = []
+
+            for attempt in range(1, GEMINI_IMAGE_MAX_ATTEMPTS + 1):
+                client = await create_gemini_client(
+                    timeout_sec=GEMINI_IMAGE_REQUEST_TIMEOUT_SEC
+                )
+                try:
+                    _patch_image_request(client)
+
+                    image_prompt = (
+                        "Create exactly one image for this request. "
+                        "Use Gemini's image generation capability. "
+                        "Return the generated image, not web search results "
+                        "and not only a textual answer.\n\n"
+                        + prompt.strip()
+                    )
+
+                    # The browser image route has its own model selection.
+                    # Unless explicitly overridden, do not pass the normal
+                    # chat-model parameter because it can route to the wrong
+                    # StreamGenerate backend.
+                    response = await client.generate_content(
+                        image_prompt,
+                        model=model_name if model_name else None,
+                    )
+                    last_response = response
+                    last_images = [
+                        image for image in (response.images or [])
+                        if getattr(image, "url", None)
+                    ]
+
+                    if last_images:
+                        published = []
+                        for image in last_images:
+                            published.append(
+                                await publish_generated_image(
+                                    image,
+                                    client,
+                                    full_size=full_size,
+                                    oidc_token=oidc_token,
+                                )
+                            )
+                        return response, published, attempt, None
+
+                finally:
+                    try:
+                        await client.close()
+                    except Exception:
+                        pass
+                    client = None
+
+                if attempt < GEMINI_IMAGE_MAX_ATTEMPTS:
+                    await asyncio.sleep(1)
+
+            return (
+                last_response,
+                [],
+                GEMINI_IMAGE_MAX_ATTEMPTS,
+                RuntimeError("Gemini Web returned no generated-image object."),
+            )
+        finally:
+            _IMAGE_MODE = False
 
 
 
@@ -960,96 +1215,73 @@ async def generate_image(request: Request):
         return error_response(400, "model must be a string", "invalid_request_error")
 
     full_size = bool(body.get("full_size", False))
-    fallback_enabled = os.getenv("ENABLE_OFFICIAL_IMAGE_FALLBACK", "true").strip().lower() not in {"0", "false", "no", "off"}
-    web_details: dict[str, Any] = {}
 
     try:
-        response, images, attempts, generation_error = await generate_and_publish_images(
-            "Generate an AI image for this request. Return the generated image, not a web image or only text.\n\n" + prompt.strip(),
+        response, images, attempts, generation_error = await _generate_web_image(
+            prompt.strip(),
             model_name=model,
             full_size=full_size,
             oidc_token=request.headers.get("x-vercel-oidc-token"),
         )
 
-        if images:
-            return {
-                "created": int(time.time()),
-                "object": "image.generation",
-                "model": model or "automatic-web",
-                "data": images,
-                "text": response.text or "",
-                "attempt": attempts,
-                "provider": "gemini-web",
-                "note": "Generated through Gemini Web and stored in public Vercel Blob.",
+        if not images:
+            details = {
+                "attempts": attempts,
+                "images_returned": len(response.images or []) if response else 0,
+                "text": response.text or "" if response else "",
+                "image_model_id": GEMINI_IMAGE_MODEL_ID,
+                "web_only": True,
+                "check": (
+                    "The endpoint uses Gemini Web cookies only. If Gemini Web "
+                    "itself says image creation is unavailable, a code change "
+                    "cannot grant that account capability."
+                ),
             }
+            if generation_error:
+                details["last_error"] = str(generation_error)
 
-        web_details = {
-            "attempts": attempts,
-            "images_returned": len(response.images or []) if response else 0,
-            "text": response.text or "" if response else "",
+            return JSONResponse(
+                {
+                    "error": {
+                        "message": (
+                            "Gemini Web did not return a generated image."
+                        ),
+                        "type": "no_image_generated",
+                        "retryable": False,
+                    },
+                    "details": details,
+                },
+                status_code=502,
+            )
+
+        return {
+            "created": int(time.time()),
+            "object": "image.generation",
+            "model": model or GEMINI_IMAGE_MODEL_ID,
+            "data": images,
+            "text": response.text or "",
+            "provider": "gemini-web",
+            "web_only": True,
+            "attempt": attempts,
+            "note": (
+                "Generated through Gemini Web cookies and stored in public "
+                "Vercel Blob. No Gemini API key is used."
+            ),
         }
-        if generation_error:
-            web_details["last_error"] = str(generation_error)
-
-        text_lower = web_details.get("text", "").lower()
-        denied = any(x in text_lower for x in (
-            "can't create any",
-            "cannot create any",
-            "image creation may not be available",
-            "can't create images",
-            "cannot create images",
-        ))
-
-        # An empty generated-image list is itself enough to activate the
-        # official fallback when an API key is configured. This covers WebAPI
-        # capability changes where Google returns little or no explanatory text.
-        should_fallback = (not images) and (denied or bool(get_official_gemini_api_key()))
-
-        if fallback_enabled and should_fallback and get_official_gemini_api_key():
-            try:
-                image = await generate_official_image(
-                    prompt.strip(),
-                    model_name=model,
-                    oidc_token=request.headers.get("x-vercel-oidc-token"),
-                )
-                return {
-                    "created": int(time.time()),
-                    "object": "image.generation",
-                    "model": model or "gemini-3.1-flash-image",
-                    "data": [image],
-                    "text": "",
-                    "provider": "google-gemini-api",
-                    "fallback": {"used": True, "reason": "Gemini Web image creation was unavailable for this session."},
-                }
-            except Exception as official_exc:
-                web_details["official_fallback_error"] = str(official_exc)
-
-        return JSONResponse(
-            {
-                "error": {
-                    "message": "Gemini Web image creation is unavailable for this session.",
-                    "type": "image_generation_unavailable",
-                    "retryable": False,
-                },
-                "details": {
-                    **web_details,
-                    "official_fallback_enabled": fallback_enabled,
-                    "official_api_configured": bool(get_official_gemini_api_key()),
-                    "next_step": "Set GEMINI_API_KEY to a Gemini Developer API key to enable the official image fallback.",
-                },
-            },
-            status_code=502,
-        )
 
     except ValueError as exc:
         return error_response(400, str(exc), "invalid_model")
     except asyncio.TimeoutError:
-        return error_response(504, "Gemini image generation timed out", "timeout")
+        return error_response(504, "Gemini Web image generation timed out", "timeout")
     except RuntimeError as exc:
         return error_response(503, str(exc), "configuration_error")
     except Exception as exc:
         LOG.exception("Image generation failed")
-        return error_response(502, f"Gemini image generation failed: {exc}", "upstream_error")
+        return error_response(
+            502,
+            f"Gemini Web image generation failed: {exc}",
+            "upstream_error",
+        )
 
 
 @app.post("/api/v1/videos/generations")
