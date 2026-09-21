@@ -18,7 +18,7 @@ from gemini_webapi import GeminiClient
 from vercel.blob import AsyncBlobClient
 
 LOG = logging.getLogger(__name__)
-APP_VERSION = "5.2-public-blob-oidc"
+APP_VERSION = "5.3-public-blob-oidc-request"
 
 app = FastAPI(
     title="Gemini Web Image/Video API",
@@ -173,6 +173,7 @@ async def publish_generated_image(
     gemini_client: GeminiClient,
     *,
     full_size: bool = False,
+    oidc_token: str | None = None,
 ) -> dict[str, Any]:
     """Download the Gemini image with its authenticated session and publish it
     as a public Vercel Blob, returning a normal direct URL."""
@@ -206,7 +207,10 @@ async def publish_generated_image(
             os.getenv("BLOB_READ_WRITE_TOKEN", "").strip()
             or os.getenv("VERCEL_BLOB_READ_WRITE_TOKEN", "").strip()
         )
-        oidc_token = os.getenv("VERCEL_OIDC_TOKEN", "").strip()
+        oidc_token = (
+            (oidc_token or "").strip()
+            or os.getenv("VERCEL_OIDC_TOKEN", "").strip()
+        )
         store_id = os.getenv("BLOB_STORE_ID", "").strip()
 
         # New Vercel Blob connections use OIDC. The Python Blob SDK version
@@ -286,9 +290,11 @@ async def publish_generated_image(
             }
 
         raise RuntimeError(
-            "Vercel Blob is not configured. This project expects OIDC "
-            "(VERCEL_OIDC_TOKEN + BLOB_STORE_ID) or a BLOB_READ_WRITE_TOKEN. "
-            "Reconnect the Blob store and redeploy."
+            "Vercel Blob OIDC is incomplete. "
+            "Missing Vercel OIDC request token or BLOB_STORE_ID. "
+            "The deployed Function should receive x-vercel-oidc-token and the "
+            "connected Blob store should provide BLOB_STORE_ID. Redeploy after "
+            "reconnecting the Blob store."
         )
 
     finally:
@@ -308,6 +314,7 @@ async def generate_and_publish_images(
     prompt: str,
     model_name: str | None = None,
     full_size: bool = False,
+    oidc_token: str | None = None,
 ):
     client = await create_gemini_client()
     try:
@@ -329,6 +336,7 @@ async def generate_and_publish_images(
                     image,
                     client,
                     full_size=full_size,
+                    oidc_token=oidc_token,
                 )
             )
 
@@ -556,6 +564,7 @@ async def generate_image(request: Request):
             + prompt.strip(),
             model_name=model,
             full_size=full_size,
+            oidc_token=request.headers.get("x-vercel-oidc-token"),
         )
 
         if not images:
