@@ -1000,7 +1000,12 @@ async def generate_image(request: Request):
             "cannot create images",
         ))
 
-        if fallback_enabled and denied and get_official_gemini_api_key():
+        # An empty generated-image list is itself enough to activate the
+        # official fallback when an API key is configured. This covers WebAPI
+        # capability changes where Google returns little or no explanatory text.
+        should_fallback = (not images) and (denied or bool(get_official_gemini_api_key()))
+
+        if fallback_enabled and should_fallback and get_official_gemini_api_key():
             try:
                 image = await generate_official_image(
                     prompt.strip(),
