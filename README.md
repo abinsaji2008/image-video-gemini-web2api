@@ -245,3 +245,7 @@ Deletion runs every minute, so the practical deletion point is approximately 1 h
 Video generation now keeps the HTTP connection active with small heartbeat chunks while Gemini renders. The application timeout is 300 seconds, matching the 300-second Vercel Function limit configured in `vercel.json`.
 
 The API no longer forces the old `gemini-omni-1.1-flash` alias. Leave `model` empty to let Gemini Web select the account's available video backend. The implementation also retries a Google "silently aborted" video request only when enough execution time remains.
+
+## Official Gemini image fallback
+
+When Gemini Web reports that image creation is unavailable, the API can automatically use Google's official Gemini Developer API. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) in Vercel Environment Variables. The fallback uses `gemini-3.1-flash-image` and uploads the returned inline image to the same public Vercel Blob path. Set `ENABLE_OFFICIAL_IMAGE_FALLBACK=false` to disable the fallback.
