@@ -451,6 +451,7 @@ async def _generate_web_image(
     oidc_token: str | None = None,
 ):
     """Generate image using Gemini Web only; no API key is used."""
+    global _IMAGE_MODE
     _patch_image_parser_once()
     client = None
 
