@@ -1,99 +1,157 @@
 # image-video-gemini-web2api
 
-A Vercel API wrapper around the reverse-engineered `gemini_webapi` Python client. It uses a Gemini Web browser session cookie rather than a Google Gemini API key.
+A Vercel API wrapper around the reverse-engineered `gemini-webapi` Python client. It uses Gemini Web session cookies instead of a Google Gemini API key.
 
-The upstream library documents cookie authentication, dynamically discovered account models, image generation, and video generation through Gemini Web. citeturn242790view0turn478410view3turn478410view4
+Generated images are downloaded through the authenticated Gemini session and then uploaded to a **public Vercel Blob**. The API returns the Blob URL, so a website can use it directly:
 
-## How it works
-
-```text
-Postman / your application
-        |
-        v
-https://YOUR_PROJECT.vercel.app/v1/...
-        |
-        | Vercel rewrite
-        v
-/api/v1/...
-        |
-        v
-FastAPI
-        |
-        v
-gemini_webapi
-        |
-        v
-Gemini Web session
+```html
+<img src="https://<store>.public.blob.vercel-storage.com/..." />
 ```
 
-The public `/v1/*` URLs are rewrites to the Vercel Python function. The FastAPI application itself lives at `api/index.py`.
+No base64 response and no image proxy API is needed. Vercel documents that public Blob URLs are directly accessible by anyone who has the URL and can be used directly in HTML. citeturn507324search3turn507324search6
 
-## Authentication
+## Required Vercel setup
 
-This project does **not** use `GEMINI_API_KEY`.
+Create a **PUBLIC** Vercel Blob store and connect it to this project:
 
-Set one of these Vercel environment configurations:
+1. Open the Vercel project.
+2. Open **Storage**.
+3. Create **Blob**.
+4. Choose **Public** access.
+5. Connect the store to this project.
+6. Make sure `BLOB_READ_WRITE_TOKEN` is available to the project's production environment.
+7. Redeploy.
 
-### Option A — full cookie
+The Python SDK used by this project supports `AsyncBlobClient.put(..., access="public")`. citeturn507324search0turn964522search0
+
+## Environment variables
+
+Gemini authentication:
 
 ```text
 GEMINI_COOKIE=__Secure-1PSID=YOUR_VALUE; __Secure-1PSIDTS=YOUR_VALUE
 ```
 
-### Option B — separate variables
+or:
 
 ```text
 GEMINI_1PSID=YOUR_VALUE
 GEMINI_1PSIDTS=YOUR_VALUE
 ```
 
-The upstream client documents `__Secure-1PSID` and optional `__Secure-1PSIDTS` for Gemini Web authentication. It also supports automatic cookie refresh while the client is running. citeturn242790view0
-
-Do not commit cookies to GitHub, Postman public collections, issues, logs, or source code.
-
-## Deploy
-
-Import this repository into Vercel.
-
-Then add these Environment Variables:
+Blob:
 
 ```text
-GEMINI_COOKIE
+BLOB_READ_WRITE_TOKEN=YOUR_VERCEL_BLOB_TOKEN
+```
+
+Optional API protection:
+
+```text
+API_KEYS=my-private-key
+```
+
+Do not put Gemini cookies or Blob tokens in GitHub source code.
+
+## Image API
+
+```http
+POST https://YOUR_PROJECT.vercel.app/v1/images/generations
+Content-Type: application/json
+```
+
+Body:
+
+```json
+{
+  "prompt": "A cinematic futuristic Kerala city at sunset"
+}
 ```
 
 Optional:
 
-```text
-GEMINI_TIMEOUT_SEC=240
-API_KEYS=my-private-key
+```json
+{
+  "prompt": "A cinematic futuristic Kerala city at sunset",
+  "model": "MODEL_ID_FROM_V1_MODELS",
+  "full_size": false
+}
 ```
 
-After changing an environment variable, redeploy the project so the new value is used.
+`full_size=false` is the fast path. Set `full_size=true` when you need the larger image; the upstream library documents that generated-image saving can request a full-size image. citeturn825738view0
 
-## Health check
-
-```http
-GET https://YOUR_PROJECT.vercel.app/
-```
-
-Also supported:
-
-```http
-GET https://YOUR_PROJECT.vercel.app/health
-GET https://YOUR_PROJECT.vercel.app/api
-GET https://YOUR_PROJECT.vercel.app/api/health
-```
-
-Expected response:
+### Response
 
 ```json
 {
-  "status": "ok",
-  "service": "image-video-gemini-web2api",
-  "auth": "gemini-web-cookie",
-  "version": "3.0-fastapi-cookie"
+  "created": 1789984558,
+  "object": "image.generation",
+  "model": "unspecified",
+  "data": [
+    {
+      "url": "https://<store>.public.blob.vercel-storage.com/gemini/images/2026/09/21/image-....png",
+      "title": "[Generated Image 0]",
+      "alt": "watermarked_img.png",
+      "type": "generated",
+      "mime_type": "image/png"
+    }
+  ],
+  "text": ""
 }
 ```
+
+That `data[0].url` is the final image URL.
+
+### Website usage
+
+Plain HTML:
+
+```html
+<img
+  src="THE_RETURNED_URL"
+  alt="Generated image"
+/>
+```
+
+JavaScript:
+
+```js
+const result = await fetch(
+  "https://YOUR_PROJECT.vercel.app/v1/images/generations",
+  {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      prompt: "A futuristic Kerala city at sunset"
+    })
+  }
+).then(r => r.json());
+
+const imageUrl = result.data[0].url;
+document.querySelector("#result").src = imageUrl;
+```
+
+The browser loads the final image directly from Vercel Blob. It does not call `/api/v1/media/image`, and it does not contain base64 in the response.
+
+## Video API
+
+The video endpoint remains:
+
+```http
+POST https://YOUR_PROJECT.vercel.app/v1/videos/generations
+```
+
+Body:
+
+```json
+{
+  "prompt": "A short cinematic video of waves on a tropical beach at sunset"
+}
+```
+
+The current implementation returns Gemini's video URL directly. Video publishing to public Blob can be added separately because generated videos can be substantially larger.
 
 ## Models
 
@@ -101,123 +159,64 @@ Expected response:
 GET https://YOUR_PROJECT.vercel.app/v1/models
 ```
 
-The model endpoint initializes the Gemini Web client and returns the models discovered for the authenticated account. The upstream library documents that its model list is dynamic and account-dependent. citeturn478410view1
+Use an ID returned by this endpoint rather than relying on old hard-coded aliases.
 
-Use a model ID returned by this endpoint for generation requests. Do not rely on old hard-coded aliases such as `gemini-flash` or `gemini-pro`.
-
-## Postman — Image generation
-
-### Request
+## Health
 
 ```http
-POST https://YOUR_PROJECT.vercel.app/v1/images/generations
-Content-Type: application/json
-Authorization: Bearer my-private-key
+GET https://YOUR_PROJECT.vercel.app/
 ```
 
-The Authorization header is required only when `API_KEYS` is configured.
-
-Body:
+Expected:
 
 ```json
 {
-  "model": "gemini-3-flash",
-  "prompt": "Generate a cinematic futuristic Kerala city at sunset."
+  "status": "ok",
+  "service": "image-video-gemini-web2api",
+  "auth": "gemini-web-cookie",
+  "version": "4.0-public-blob",
+  "image_delivery": "public-vercel-blob"
 }
 ```
 
-You can also omit `model`:
+## Why the old link did not work
 
-```json
-{
-  "prompt": "Generate a cinematic futuristic Kerala city at sunset."
-}
-```
+Gemini returned a Google-hosted `lh3.googleusercontent.com/gg-dl/...` URL. That URL is tied to the Gemini image/session delivery path and is not a reliable permanent public asset URL. The upstream `gemini-webapi` image implementation uses an authenticated request client when saving generated images. citeturn825738view0
 
-The backend explicitly asks Gemini to return a generated image rather than a web image. The upstream package distinguishes generated images from web images and exposes generated images in `response.images`. citeturn478410view3turn870978view0
-
-### Successful response
-
-```json
-{
-  "created": 1789983914,
-  "object": "image.generation",
-  "model": "gemini-3-flash",
-  "data": [
-    {
-      "url": "https://...",
-      "title": "...",
-      "alt": "...",
-      "type": "generated"
-    }
-  ],
-  "text": ""
-}
-```
-
-## Postman — Video generation
-
-### Request
-
-```http
-POST https://YOUR_PROJECT.vercel.app/v1/videos/generations
-Content-Type: application/json
-Authorization: Bearer my-private-key
-```
-
-Body:
-
-```json
-{
-  "model": "gemini-3-pro",
-  "prompt": "Generate a short cinematic video of waves on a tropical beach at sunset."
-}
-```
-
-The upstream package exposes generated videos as `GeneratedVideo` objects in `ModelOutput.videos`. Video generation access can depend on the account and Gemini subscription. citeturn478410view4turn870978view2
-
-## Direct /api URLs
-
-The FastAPI routes are also available directly:
+The new flow is:
 
 ```text
-GET  /api
-GET  /api/health
-GET  /api/v1/models
-POST /api/v1/images/generations
-POST /api/v1/videos/generations
+Postman / website
+        |
+        v
+Vercel API
+        |
+        v
+Gemini Web cookie
+        |
+        v
+Generated image
+        |
+        v
+Authenticated download
+        |
+        v
+PUBLIC Vercel Blob
+        |
+        v
+https://<store>.public.blob.vercel-storage.com/...
 ```
-
-The shorter `/v1/*` URLs are provided by the Vercel rewrites in `vercel.json`.
-
-## Error responses
-
-The API now reports different failure classes instead of returning a generic 404/500:
-
-- `400 invalid_request_error` — malformed JSON, missing prompt, or invalid model type
-- `400 invalid_model` — the selected model name is not accepted by Gemini Web
-- `401 invalid_api_key` — `API_KEYS` is configured and the request key is wrong
-- `503 configuration_error` — the Gemini session cookie is missing
-- `502 upstream_error` — Gemini Web or the reverse-engineered client failed
-- `502 no_image_generated` — Gemini replied but no generated image was returned
-- `502 no_video_generated` — Gemini replied but no generated video was returned
-- `504 timeout` — the Gemini request exceeded the configured timeout
-
-## Important limitations
-
-This project uses reverse-engineered Gemini Web internals rather than an official Google API, so compatibility can change when Google changes the Gemini web application or its internal endpoints. citeturn242790view0turn131287view1
-
-Image and video availability can also depend on the account, country/language, school/work account restrictions, age requirements, and subscription. Google's current Gemini Apps help documents separate eligibility rules for image generation/editing, and the upstream library notes that video generation may require an active subscription. citeturn287843search0turn478410view4
 
 ## Security
 
-Never place your Gemini cookie in:
+The Blob URL is intentionally public. Anyone who has the URL can retrieve the image. Vercel's documentation distinguishes public Blob delivery from private Blob delivery. citeturn507324search3
 
-- GitHub source files
-- README files
-- public Postman collections
-- GitHub Issues
-- client-side JavaScript
-- public logs
+Keep these secrets private:
 
-Store it only in Vercel Environment Variables or another secret store.
+- Gemini Web session cookies
+- `BLOB_READ_WRITE_TOKEN`
+- `API_KEYS`
+
+## Limitations
+
+This project uses reverse-engineered Gemini Web internals rather than an official Google API, so compatibility can change with the Gemini web application. The underlying library may also be affected by account, region, subscription, or feature availability. citeturn610657view0
