@@ -25,7 +25,6 @@ from vercel.blob import AsyncBlobClient
 LOG = logging.getLogger(__name__)
 APP_VERSION = "7.0-long-video-image-fix"
 MEDIA_TTL_SEC = 3600
-IMAGE_MAX_ATTEMPTS = max(1, int(os.getenv("GEMINI_IMAGE_MAX_ATTEMPTS", "2")))
 VIDEO_TOTAL_TIMEOUT_SEC = min(300.0, max(60.0, float(os.getenv("GEMINI_VIDEO_MAX_SECONDS", "300"))))
 VIDEO_MAX_ATTEMPTS = max(1, int(os.getenv("GEMINI_VIDEO_MAX_ATTEMPTS", "2")))
 VIDEO_RETRY_MIN_REMAINING_SEC = float(os.getenv("GEMINI_VIDEO_RETRY_MIN_REMAINING_SEC", "180"))
@@ -33,7 +32,7 @@ VIDEO_RETRY_MIN_REMAINING_SEC = float(os.getenv("GEMINI_VIDEO_RETRY_MIN_REMAININ
 # These parameters are configurable because Google can rotate the internal model id.
 GEMINI_IMAGE_MODEL_ID = os.getenv("GEMINI_IMAGE_MODEL_ID", "56fdd199312815e2").strip()
 GEMINI_IMAGE_MAX_ATTEMPTS = max(1, int(os.getenv("GEMINI_IMAGE_MAX_ATTEMPTS", "2")))
-GEMINI_IMAGE_REQUEST_TIMEOUT_SEC = float(os.getenv("GEMINI_IMAGE_REQUEST_TIMEOUT_SEC", "300"))
+GEMINI_IMAGE_REQUEST_TIMEOUT_SEC = min(300.0, max(30.0, float(os.getenv("GEMINI_IMAGE_REQUEST_TIMEOUT_SEC", "300"))))
 _IMAGE_PATCH_LOCK = asyncio.Lock()
 _IMAGE_MODE = False
 _IMAGE_PATCHED = False
@@ -318,9 +317,11 @@ def _patch_image_request(client: GeminiClient) -> None:
                         if index < len(inner):
                             inner[index] = value
 
-                    # Keep the UUID identical in the body and headers.
+                    # Keep the UUID and browser image model number synchronized.
                     if len(inner) > 59:
                         inner[59] = request_uuid
+                    if len(inner) > 79:
+                        inner[79] = 1
 
                     outer[1] = json.dumps(inner)
                     data["f.req"] = json.dumps(outer)
@@ -367,14 +368,9 @@ async def _generate_web_image(
                         + prompt.strip()
                     )
 
-                    # The browser image route has its own model selection.
-                    # Unless explicitly overridden, do not pass the normal
-                    # chat-model parameter because it can route to the wrong
-                    # StreamGenerate backend.
-                    response = await client.generate_content(
-                        image_prompt,
-                        model=model_name if model_name else None,
-                    )
+                    # The browser image route has its own image backend selection.
+                    # The patched request supplies the browser image model header.
+                    response = await client.generate_content(image_prompt)
                     last_response = response
                     last_images = [
                         image for image in (response.images or [])
