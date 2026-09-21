@@ -1,1 +1,1 @@
-# No third-party Python packages required.
+gemini-webapi==2.1.1
