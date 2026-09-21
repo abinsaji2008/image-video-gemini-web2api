@@ -1,1 +1,2 @@
+fastapi>=0.115,<1
 gemini-webapi==2.1.1
