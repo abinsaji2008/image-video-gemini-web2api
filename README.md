@@ -223,7 +223,7 @@ This project uses reverse-engineered Gemini Web internals rather than an officia
 
 ## Temporary media and automatic cleanup
 
-Generated images and videos are uploaded to the public Blob store and are marked with a 1 hour TTL. The project runs `/api/cron/cleanup` every minute and removes expired `gemini/` blobs. Vercel documents that Cron Jobs can be configured in `vercel.json` and triggered in production.
+Generated images and videos are uploaded to the public Blob store and are marked with a 1 hour TTL. The project runs `/api/cron/cleanup` on the schedule in `vercel.json` and removes expired `gemini/` blobs. Vercel documents that Cron Jobs can be configured in `vercel.json` and triggered in production.
 
 Set a production environment variable:
 
@@ -237,7 +237,7 @@ The website provides an **Image / Video** switch, inline preview, direct public 
 
 Video generation uses `response.videos` and `video.save()` from the upstream `gemini-webapi` package. Video generation availability depends on the Gemini account/model.
 
-Deletion runs every minute, so the practical deletion point is approximately 1 hour after upload. Vercel notes that deleted blobs can remain in the CDN cache for up to about one minute.
+The practical deletion point depends on the configured cleanup cron schedule; the application records a 1-hour retention window. Vercel notes that deleted blobs can remain in the CDN cache for up to about one minute.
 
 
 ## Long-running video generation
