@@ -599,7 +599,7 @@ pre{margin:0;background:#070c16;border:1px solid #27344f;border-radius:11px;padd
 <label>Model (optional)</label>
 <input id="model" placeholder="Leave empty for default">
 <label>API key (optional)</label>
-<input id="key" type="password" placeholder="Only when API_KEYS is configured">
+<input id="key" type="password" value="my-secret-api-key" placeholder="Only when API_KEYS is configured">
 <div class="hint">Video generation may take longer while Gemini renders the video.</div>
 <div class="row" style="margin-top:15px"><button id="go" class="btn primary">Generate Image</button><button id="stop" class="btn secondary" disabled>Cancel</button></div>
 <div id="status" class="status">Ready.</div><div id="timer" class="timer">Elapsed: 0s</div><div id="ttl" class="timer"></div>
