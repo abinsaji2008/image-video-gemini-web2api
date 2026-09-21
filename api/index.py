@@ -217,6 +217,8 @@ class handler(BaseHTTPRequestHandler):
                     "status": "ok",
                     "service": "image-video-gemini-web2api",
                     "auth": "gemini-web-cookie",
+                    "version": "2.0-cookie-image-video",
+                    "build": "200ef3e4",
                 },
             )
             return
