@@ -242,6 +242,6 @@ Deletion runs every minute, so the practical deletion point is approximately 1 h
 
 ## Long-running video generation
 
-Video generation now keeps the HTTP connection active with small heartbeat chunks while Gemini renders. The application timeout is 780 seconds, leaving margin below the 800-second Vercel Function limit configured in `vercel.json`. Vercel's 800-second limit is available on Pro/Enterprise; Hobby remains limited to 300 seconds for a single function execution.
+Video generation now keeps the HTTP connection active with small heartbeat chunks while Gemini renders. The application timeout is 300 seconds, matching the 300-second Vercel Function limit configured in `vercel.json`.
 
 The API no longer forces the old `gemini-omni-1.1-flash` alias. Leave `model` empty to let Gemini Web select the account's available video backend. The implementation also retries a Google "silently aborted" video request only when enough execution time remains.
