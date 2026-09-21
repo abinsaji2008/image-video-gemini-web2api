@@ -22,7 +22,7 @@ Create a **PUBLIC** Vercel Blob store and connect it to this project:
 6. Make sure `BLOB_READ_WRITE_TOKEN` is available to the project's production environment.
 7. Redeploy.
 
-The Python SDK used by this project uses the Vercel Blob read/write token from `BLOB_READ_WRITE_TOKEN` (or `VERCEL_BLOB_READ_WRITE_TOKEN`) and uploads with `access="public"`.
+The project uses Vercel Blob OIDC for production uploads. Vercel documents that OIDC connections use the short-lived `VERCEL_OIDC_TOKEN` together with the connected `BLOB_STORE_ID`, avoiding a long-lived read/write token.
 
 ## Environment variables
 
