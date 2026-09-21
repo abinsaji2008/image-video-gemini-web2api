@@ -23,7 +23,7 @@ LOG = logging.getLogger(__name__)
 APP_VERSION = "7.0-long-video-image-fix"
 MEDIA_TTL_SEC = 3600
 IMAGE_MAX_ATTEMPTS = max(1, int(os.getenv("GEMINI_IMAGE_MAX_ATTEMPTS", "2")))
-VIDEO_TOTAL_TIMEOUT_SEC = min(780.0, max(60.0, float(os.getenv("GEMINI_VIDEO_MAX_SECONDS", "780")))
+VIDEO_TOTAL_TIMEOUT_SEC = min(780.0, max(60.0, float(os.getenv("GEMINI_VIDEO_MAX_SECONDS", "780"))))
 VIDEO_MAX_ATTEMPTS = max(1, int(os.getenv("GEMINI_VIDEO_MAX_ATTEMPTS", "2")))
 VIDEO_RETRY_MIN_REMAINING_SEC = float(os.getenv("GEMINI_VIDEO_RETRY_MIN_REMAINING_SEC", "180"))
 
