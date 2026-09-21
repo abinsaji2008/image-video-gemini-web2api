@@ -22,7 +22,7 @@
   "crons": [
     {
       "path": "/api/cron/cleanup",
-      "schedule": "* * * * *"
+      "schedule": "0 0 * * *"
     }
   ]
 }
