@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gemini Web Image API</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#0a0f1c;color:#eef3ff;font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif}
+.wrap{max-width:1100px;margin:auto;padding:28px 18px 60px}
+header{margin-bottom:20px}
+h1{margin:0 0 8px;font-size:clamp(28px,4vw,44px)}
+p{color:#98a6c4;line-height:1.55}
+.grid{display:grid;grid-template-columns:360px 1fr;gap:18px}
+.card{background:#11182a;border:1px solid #26314a;border-radius:18px;padding:18px}
+label{display:block;color:#9daccc;font-size:13px;margin-bottom:7px}
+textarea,input,button{font:inherit}
+textarea,input{width:100%;background:#0b1220;color:#eef3ff;border:1px solid #2b3854;border-radius:12px;padding:11px 12px;outline:none}
+textarea{min-height:150px;resize:vertical}
+input:focus,textarea:focus{border-color:#6c93ff}
+.row{display:flex;gap:8px}
+button{border:0;border-radius:12px;padding:11px 14px;cursor:pointer;font-weight:700}
+.primary{background:#5d86ff;color:white;flex:1}
+.secondary{background:#232e47;color:#eef3ff}
+button:disabled{opacity:.55;cursor:not-allowed}
+.field{margin-bottom:14px}
+.status{margin-top:12px;min-height:22px;color:#9daccc;font-size:13px}
+.status.ok{color:#89e0a1}.status.err{color:#ff9a9a}
+.preview{min-height:430px;background:#0a101c;border:1px dashed #2b3854;border-radius:14px;display:flex;align-items:center;justify-content:center;overflow:hidden}
+.preview img{max-width:100%;max-height:650px;display:none}
+.empty{text-align:center;color:#647291;padding:40px}
+.timer{font-size:12px;color:#71809f;margin-top:8px}
+pre{margin:0;background:#080d18;border:1px solid #222e47;border-radius:12px;padding:14px;overflow:auto;max-height:460px;color:#d8e2ff;font-size:12px;line-height:1.45;white-space:pre-wrap;word-break:break-word}
+.json-head{display:flex;justify-content:space-between;align-items:center;margin:18px 0 8px}
+.small{font-size:12px;color:#72809c}
+a{color:#8fb1ff;text-decoration:none}
+@media(max-width:800px){.grid{grid-template-columns:1fr}.preview{min-height:340px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+<h1>Gemini Web Image Generator</h1>
+<p>Generate through your Gemini Web session and inspect the exact JSON response. The browser keeps the request open while Gemini is working, so you are not limited by a short Postman client timeout.</p>
+</header>
+
+<div class="grid">
+<section class="card">
+<div class="field">
+<label for="prompt">Prompt</label>
+<textarea id="prompt" placeholder="A cinematic futuristic Kerala city at sunset"></textarea>
+</div>
+
+<div class="field">
+<label for="model">Model (optional)</label>
+<input id="model" placeholder="Leave empty for Gemini default">
+</div>
+
+<div class="field">
+<label for="apiKey">API key (optional)</label>
+<input id="apiKey" type="password" placeholder="Only if API_KEYS is configured">
+</div>
+
+<div class="field">
+<label><input id="fullSize" type="checkbox" style="width:auto;margin-right:7px">Request full-size image</label>
+</div>
+
+<div class="row">
+<button class="primary" id="generate">Generate image</button>
+<button class="secondary" id="cancel" disabled>Cancel</button>
+</div>
+
+<div id="status" class="status">Ready.</div>
+<div id="timer" class="timer">Elapsed: 0s</div>
+</section>
+
+<section class="card">
+<div class="preview" id="preview">
+<div id="empty" class="empty">Generated image will appear here.</div>
+<img id="image" alt="Generated image">
+</div>
+
+<div id="imageLinks" style="display:none;margin-top:12px">
+<div class="small">Direct public image URL</div>
+<a id="imageUrl" target="_blank" rel="noopener"></a>
+</div>
+
+<div class="json-head">
+<strong>Response JSON</strong>
+<button class="secondary" id="copyJson" style="padding:7px 10px">Copy JSON</button>
+</div>
+<pre id="json">{}</pre>
+</section>
+</div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+let controller=null,started=0,timerId=null,lastJson={};
+
+function setStatus(t,c=""){$("status").textContent=t;$("status").className="status "+c}
+function startTimer(){
+ started=Date.now();
+ $("timer").textContent="Elapsed: 0s";
+ clearInterval(timerId);
+ timerId=setInterval(()=>{
+   $("timer").textContent="Elapsed: "+Math.floor((Date.now()-started)/1000)+"s";
+ },1000);
+}
+function stopTimer(){clearInterval(timerId);timerId=null}
+function showJson(obj){
+ lastJson=obj;
+ $("json").textContent=JSON.stringify(obj,null,2);
+}
+function authHeaders(){
+ const h={"Content-Type":"application/json"};
+ const key=$("apiKey").value.trim();
+ if(key) h.Authorization="Bearer "+key;
+ return h;
+}
+
+$("generate").onclick=async()=>{
+ const prompt=$("prompt").value.trim();
+ if(!prompt){setStatus("Enter a prompt first.","err");return}
+
+ controller=new AbortController();
+ $("generate").disabled=true;
+ $("cancel").disabled=false;
+ $("image").style.display="none";
+ $("empty").style.display="block";
+ $("imageLinks").style.display="none";
+ showJson({});
+ setStatus("Generating… Gemini can take more than 30 seconds.");
+ startTimer();
+
+ const body={prompt};
+ const model=$("model").value.trim();
+ if(model) body.model=model;
+ if($("fullSize").checked) body.full_size=true;
+
+ try{
+   const res=await fetch("/v1/images/generations",{
+     method:"POST",
+     headers:authHeaders(),
+     body:JSON.stringify(body),
+     signal:controller.signal
+   });
+
+   const text=await res.text();
+   let data;
+   try{data=JSON.parse(text)}catch{data={raw:text}}
+   showJson(data);
+
+   if(!res.ok) throw new Error(data?.error?.message || ("HTTP "+res.status));
+
+   const url=data?.data?.[0]?.url;
+   if(!url) throw new Error("No image URL returned.");
+
+   $("image").src=url;
+   $("image").style.display="block";
+   $("empty").style.display="none";
+   $("imageUrl").href=url;
+   $("imageUrl").textContent=url;
+   $("imageLinks").style.display="block";
+   setStatus("Image generated successfully.","ok");
+ }catch(err){
+   if(err.name==="AbortError") setStatus("Generation cancelled.");
+   else setStatus(err.message || "Generation failed.","err");
+ }finally{
+   $("generate").disabled=false;
+   $("cancel").disabled=true;
+   controller=null;
+   stopTimer();
+ }
+};
+
+$("cancel").onclick=()=>{
+ if(controller) controller.abort();
+};
+
+$("copyJson").onclick=async()=>{
+ try{
+   await navigator.clipboard.writeText(JSON.stringify(lastJson,null,2));
+   $("copyJson").textContent="Copied";
+   setTimeout(()=>$("copyJson").textContent="Copy JSON",1200);
+ }catch{
+   setStatus("Browser blocked clipboard access.","err");
+ }
+};
+</script>
+</body>
+</html>
