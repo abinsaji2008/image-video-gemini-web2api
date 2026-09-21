@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -147,6 +148,72 @@ async def generate(prompt: str, model_name: str | None = None):
         await client.close()
 
 
+async def generate_images_with_download(prompt: str, model_name: str | None = None):
+    """
+    Generate images and immediately download them through the authenticated
+    Gemini session. Raw lh3.googleusercontent.com URLs can require the
+    Gemini session/cookies and are not always directly openable in a browser.
+    """
+    client = await create_client()
+    try:
+        if model_name:
+            response = await client.generate_content(prompt, model=model_name)
+        else:
+            response = await client.generate_content(prompt)
+
+        results = []
+        for index, image in enumerate(response.images or []):
+            url = getattr(image, "url", None)
+            item = media_dict(image, "image")
+
+            if not url:
+                results.append(item)
+                continue
+
+            filename = f"/tmp/gemini-image-{time.time_ns()}-{index}.png"
+
+            try:
+                saved_path = await image.save(
+                    path="/tmp",
+                    filename=filename,
+                    verbose=False,
+                    client=client.client,
+                    full_size=True,
+                )
+
+                with open(saved_path, "rb") as file:
+                    raw = file.read()
+
+                mime = "image/png"
+                if raw.startswith(b"\xff\xd8\xff"):
+                    mime = "image/jpeg"
+                elif raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
+                    mime = "image/webp"
+
+                encoded = base64.b64encode(raw).decode("ascii")
+                item["mime_type"] = mime
+                item["b64_json"] = encoded
+                item["data_url"] = f"data:{mime};base64,{encoded}"
+                item["downloaded"] = True
+
+                try:
+                    os.remove(saved_path)
+                except OSError:
+                    pass
+
+            except Exception as exc:
+                LOG.warning("Authenticated image download failed: %s", exc)
+                item["downloaded"] = False
+                item["download_error"] = str(exc)
+
+            results.append(item)
+
+        return response, results
+
+    finally:
+        await client.close()
+
+
 def media_dict(obj: Any, kind: str) -> dict[str, Any]:
     if kind == "image":
         return {
@@ -253,25 +320,19 @@ async def generate_image(request: Request):
         )
 
     try:
-        response = await generate(
+        response, images = await generate_images_with_download(
             "Generate an image for this request. Return the generated image, "
             "not a web image.\n\n"
             + prompt.strip(),
             model_name=model,
         )
 
-        images = [
-            media_dict(image, "image")
-            for image in (response.images or [])
-            if getattr(image, "url", None)
-        ]
+        generated = [image for image in images if image.get("url")]
 
-        if not images:
+        if not generated:
             return error_response(
                 502,
-                "Gemini completed the request but returned no generated "
-                "image. The account or selected model may not have image "
-                "generation access.",
+                "Gemini completed the request but returned no generated image.",
                 "no_image_generated",
             )
 
@@ -279,8 +340,12 @@ async def generate_image(request: Request):
             "created": int(time.time()),
             "object": "image.generation",
             "model": model or "unspecified",
-            "data": images,
+            "data": generated,
             "text": response.text or "",
+            "note": (
+                "Use data_url or b64_json to open the image. The raw Google "
+                "lh3 URL may require the Gemini session and may expire."
+            ),
         }
 
     except ValueError as exc:
@@ -296,7 +361,6 @@ async def generate_image(request: Request):
             f"Gemini image generation failed: {exc}",
             "upstream_error",
         )
-
 
 @app.post("/api/v1/videos/generations")
 async def generate_video(request: Request):
