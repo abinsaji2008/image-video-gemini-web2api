@@ -223,7 +223,7 @@ This project uses reverse-engineered Gemini Web internals rather than an officia
 
 ## Temporary media and automatic cleanup
 
-Generated images and videos are uploaded to the public Blob store and are marked with a 5 minute TTL. The project runs `/api/cron/cleanup` every minute and removes expired `gemini/` blobs. Vercel documents that Cron Jobs can be configured in `vercel.json` and triggered in production.
+Generated images and videos are uploaded to the public Blob store and are marked with a 1 hour TTL. The project runs `/api/cron/cleanup` every minute and removes expired `gemini/` blobs. Vercel documents that Cron Jobs can be configured in `vercel.json` and triggered in production.
 
 Set a production environment variable:
 
@@ -237,4 +237,11 @@ The website provides an **Image / Video** switch, inline preview, direct public 
 
 Video generation uses `response.videos` and `video.save()` from the upstream `gemini-webapi` package. Video generation availability depends on the Gemini account/model.
 
-Deletion runs every minute, so the practical deletion point is approximately 5 to 6 minutes after upload. Vercel notes that deleted blobs can remain in the CDN cache for up to about one minute.
+Deletion runs every minute, so the practical deletion point is approximately 1 hour after upload. Vercel notes that deleted blobs can remain in the CDN cache for up to about one minute.
+
+
+## Long-running video generation
+
+Video generation now keeps the HTTP connection active with small heartbeat chunks while Gemini renders. The application timeout is 780 seconds, leaving margin below the 800-second Vercel Function limit configured in `vercel.json`. Vercel's 800-second limit is available on Pro/Enterprise; Hobby remains limited to 300 seconds for a single function execution.
+
+The API no longer forces the old `gemini-omni-1.1-flash` alias. Leave `model` empty to let Gemini Web select the account's available video backend. The implementation also retries a Google "silently aborted" video request only when enough execution time remains.
