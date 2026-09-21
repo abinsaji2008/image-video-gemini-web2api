@@ -847,12 +847,22 @@ async def generate_video(request: Request):
                         payload = {
                             "error": {
                                 "message": (
-                                    "Gemini completed the request but returned no "
-                                    "generated video. Your Gemini account or selected "
-                                    "model may not have video generation access."
+                                    "Gemini did not return a generated video. "
+                                    "This means the request reached Gemini, but video "
+                                    "generation is unavailable for the current Gemini "
+                                    "account/session or the feature was not activated."
                                 ),
-                                "type": "no_video_generated",
-                            }
+                                "type": "video_feature_unavailable",
+                            },
+                            "details": {
+                                "videos_returned": len(response.videos or []),
+                                "media_returned": len(response.media or []),
+                                "text": response.text or "",
+                                "check": (
+                                    "Open Gemini Apps with the same Google account and "
+                                    "verify that the Create video feature is available."
+                                ),
+                            },
                         }
                     else:
                         payload = {
