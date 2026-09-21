@@ -20,7 +20,7 @@ from gemini_webapi import GeminiClient
 from vercel.blob import AsyncBlobClient
 
 LOG = logging.getLogger(__name__)
-APP_VERSION = "6.0-image-video-download-ttl"
+APP_VERSION = "6.1-video-save-result-fix"
 MEDIA_TTL_SEC = 300
 
 app = FastAPI(
@@ -359,20 +359,41 @@ async def publish_generated_video(
         saved = await video.save(
             path=tmp_dir,
             verbose=False,
+            client=gemini_client.client,
         )
-        saved_path = Path(saved)
+
+        # gemini-webapi Video.save() returns a dict such as
+        # {"video": "/tmp/...mp4", "video_thumbnail": "..."}.
+        video_file = saved.get("video") if isinstance(saved, dict) else saved
+        if not video_file:
+            raise RuntimeError("Gemini returned no downloadable video file.")
+
+        saved_path = Path(video_file)
+        if not saved_path.exists():
+            raise RuntimeError(
+                f"Gemini video download completed without a local file: {saved_path}"
+            )
+
         raw = saved_path.read_bytes()
-
-        try:
-            saved_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-
         content_type = mimetypes.guess_type(saved_path.name)[0] or "video/mp4"
         if not content_type.startswith("video/"):
             content_type = "video/mp4"
 
         ext = saved_path.suffix.lower() or ".mp4"
+
+        # Delete the downloaded video (and thumbnail, when present) before
+        # uploading from memory to Vercel Blob.
+        thumbnail_file = (
+            Path(saved.get("video_thumbnail"))
+            if isinstance(saved, dict) and saved.get("video_thumbnail")
+            else None
+        )
+        try:
+            saved_path.unlink(missing_ok=True)
+            if thumbnail_file:
+                thumbnail_file.unlink(missing_ok=True)
+        except OSError:
+            pass
         pathname = (
             f"gemini/videos/"
             f"{time.strftime('%Y/%m/%d')}/"
