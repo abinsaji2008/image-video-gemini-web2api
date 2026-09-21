@@ -10,7 +10,7 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from gemini_webapi import GeminiClient
 from vercel.blob import AsyncBlobClient
 
@@ -292,6 +292,101 @@ def media_dict(obj: Any, kind: str) -> dict[str, Any]:
         "thumbnail": getattr(obj, "thumbnail", None),
         "type": obj.__class__.__name__,
     }
+
+
+@app.get("/api", response_class=HTMLResponse)
+async def website():
+    return HTMLResponse(
+        """
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gemini Image Generator</title>
+<style>
+body{margin:0;background:#0b1020;color:#eef3ff;font-family:system-ui,sans-serif}
+main{max-width:1100px;margin:auto;padding:28px}
+h1{margin:0 0 8px}p{color:#9eabc5}
+.grid{display:grid;grid-template-columns:360px 1fr;gap:18px}
+.card{background:#121a2d;border:1px solid #293650;border-radius:16px;padding:18px}
+textarea,input,button{font:inherit}
+textarea,input{width:100%;box-sizing:border-box;background:#0b1220;color:#eef3ff;border:1px solid #33415f;border-radius:10px;padding:11px;margin:6px 0 14px}
+textarea{min-height:150px;resize:vertical}
+.row{display:flex;gap:8px}
+button{border:0;border-radius:10px;padding:11px 15px;font-weight:700;cursor:pointer}
+#go{background:#5e87ff;color:white;flex:1}#stop{background:#25324d;color:white}
+button:disabled{opacity:.5}
+.preview{min-height:420px;background:#080e1a;border:1px dashed #33415f;border-radius:12px;display:flex;align-items:center;justify-content:center;overflow:hidden}
+#image{max-width:100%;max-height:650px;display:none}
+.status{font-size:13px;color:#9eabc5;margin-top:12px}.err{color:#ff9a9a}.ok{color:#8ee0a2}
+small{color:#71809a}
+pre{background:#080e1a;border:1px solid #293650;border-radius:12px;padding:12px;overflow:auto;max-height:380px;white-space:pre-wrap;word-break:break-word;font-size:12px}
+a{color:#9dbbff;word-break:break-all}
+@media(max-width:800px){.grid{grid-template-columns:1fr}main{padding:18px}.preview{min-height:320px}}
+</style>
+</head>
+<body>
+<main>
+<h1>Gemini Image Generator</h1>
+<p>Generate through your Gemini Web session. The page keeps the request open while Gemini is working and shows the exact JSON response.</p>
+<div class="grid">
+<section class="card">
+<label>Prompt</label>
+<textarea id="prompt" placeholder="A cinematic futuristic Kerala city at sunset"></textarea>
+<label>Model (optional)</label>
+<input id="model" placeholder="Leave empty for default">
+<label>API key (optional)</label>
+<input id="key" type="password" placeholder="Only if API_KEYS is configured">
+<label><input id="full" type="checkbox" style="width:auto;margin-right:6px"> full-size image</label>
+<div class="row">
+<button id="go">Generate</button>
+<button id="stop" disabled>Cancel</button>
+</div>
+<div id="status" class="status">Ready.</div>
+<div id="time"><small>Elapsed: 0s</small></div>
+</section>
+<section class="card">
+<div class="preview"><div id="empty"><small>No image yet</small></div><img id="image"></div>
+<div id="link" style="display:none;margin-top:12px"><small>Direct public image URL</small><br><a id="url" target="_blank" rel="noopener"></a></div>
+<div style="display:flex;justify-content:space-between;align-items:center;margin:18px 0 8px"><b>JSON response</b><button id="copy" style="padding:7px 10px;background:#25324d;color:white">Copy JSON</button></div>
+<pre id="json">{}</pre>
+</section>
+</div>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+let ctl=null,timer=null,start=0,last={};
+function status(t,c=""){$("status").textContent=t;$("status").className="status "+c}
+function show(o){last=o;$("json").textContent=JSON.stringify(o,null,2)}
+function tick(){start=Date.now();clearInterval(timer);timer=setInterval(()=>{$("time").innerHTML="<small>Elapsed: "+Math.floor((Date.now()-start)/1000)+"s</small>"},1000)}
+function stopTick(){clearInterval(timer);timer=null}
+$("go").onclick=async()=>{
+  const prompt=$("prompt").value.trim();
+  if(!prompt){status("Enter a prompt.","err");return}
+  ctl=new AbortController();$("go").disabled=true;$("stop").disabled=false;
+  $("image").style.display="none";$("empty").style.display="block";$("link").style.display="none";show({});
+  status("Generating… this can take more than 30 seconds.");tick();
+  const headers={"Content-Type":"application/json"};
+  if($("key").value.trim())headers.Authorization="Bearer "+$("key").value.trim();
+  const body={prompt};if($("model").value.trim())body.model=$("model").value.trim();if($("full").checked)body.full_size=true;
+  try{
+    const r=await fetch("/v1/images/generations",{method:"POST",headers,body:JSON.stringify(body),signal:ctl.signal});
+    const txt=await r.text();let data;try{data=JSON.parse(txt)}catch{data={raw:txt}}show(data);
+    if(!r.ok)throw new Error(data?.error?.message||("HTTP "+r.status));
+    const imageUrl=data?.data?.[0]?.url;if(!imageUrl)throw new Error("No image URL returned.");
+    $("image").src=imageUrl;$("image").style.display="block";$("empty").style.display="none";
+    $("url").href=imageUrl;$("url").textContent=imageUrl;$("link").style.display="block";status("Done.","ok");
+  }catch(e){if(e.name==="AbortError")status("Cancelled.");else status(e.message||"Generation failed.","err")}
+  finally{$("go").disabled=false;$("stop").disabled=true;ctl=null;stopTick()}
+};
+$("stop").onclick=()=>{if(ctl)ctl.abort()};
+$("copy").onclick=async()=>{try{await navigator.clipboard.writeText(JSON.stringify(last,null,2));$("copy").textContent="Copied";setTimeout(()=>$("copy").textContent="Copy JSON",1000)}catch{}};
+</script>
+</body>
+</html>
+        """
+    )
 
 
 @app.get("/api")
