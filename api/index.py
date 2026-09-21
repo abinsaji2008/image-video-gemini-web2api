@@ -15,7 +15,7 @@ from gemini_webapi import GeminiClient
 from vercel.blob import AsyncBlobClient
 
 LOG = logging.getLogger(__name__)
-APP_VERSION = "5.0-public-blob-oidc"
+APP_VERSION = "5.1-public-blob-token"
 
 app = FastAPI(
     title="Gemini Web Image/Video API",
@@ -199,9 +199,20 @@ async def publish_generated_image(
             f"image-{time.time_ns()}.png"
         )
 
-        # No token is passed explicitly. On Vercel, the SDK resolves
-        # the connected project's Blob credentials automatically.
-        async with AsyncBlobClient() as blob_client:
+        # Vercel Blob requires the project's Blob read/write token.
+        # Accept both names used by Vercel integrations.
+        blob_token = (
+            os.getenv("BLOB_READ_WRITE_TOKEN", "").strip()
+            or os.getenv("VERCEL_BLOB_READ_WRITE_TOKEN", "").strip()
+        )
+        if not blob_token:
+            raise RuntimeError(
+                "Vercel Blob is not configured. Create/connect a PUBLIC Vercel Blob store "
+                "to this project and expose BLOB_READ_WRITE_TOKEN in the Production "
+                "environment, then redeploy."
+            )
+
+        async with AsyncBlobClient(token=blob_token) as blob_client:
             uploaded = await blob_client.put(
                 pathname,
                 raw,
