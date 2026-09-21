@@ -20,7 +20,7 @@ from gemini_webapi import GeminiClient
 from vercel.blob import AsyncBlobClient
 
 LOG = logging.getLogger(__name__)
-APP_VERSION = "6.2-video-cloudflare-heartbeat"
+APP_VERSION = "6.5-video-12min-timeout-media-fallback"
 MEDIA_TTL_SEC = 300
 
 app = FastAPI(
@@ -153,10 +153,16 @@ def blob_oidc_credentials(
     return token, store_id
 
 
-async def create_gemini_client() -> GeminiClient:
+async def create_gemini_client(
+    timeout_sec: float | None = None,
+) -> GeminiClient:
     psid, psidts = get_credentials()
     client = GeminiClient(psid, psidts, proxy=None)
-    timeout = float(os.getenv("GEMINI_TIMEOUT_SEC", "240"))
+    timeout = (
+        float(timeout_sec)
+        if timeout_sec is not None
+        else float(os.getenv("GEMINI_TIMEOUT_SEC", "240"))
+    )
 
     await client.init(
         timeout=timeout,
@@ -356,11 +362,15 @@ async def publish_generated_video(
     saved_path: Path | None = None
 
     try:
-        saved = await video.save(
-            path=tmp_dir,
-            verbose=False,
-            client=gemini_client.client,
-        )
+        save_kwargs: dict[str, Any] = {
+            "path": tmp_dir,
+            "verbose": False,
+            "client": gemini_client.client,
+        }
+        if video.__class__.__name__ == "GeneratedMedia":
+            save_kwargs["download_type"] = "video"
+
+        saved = await video.save(**save_kwargs)
 
         # gemini-webapi Video.save() returns a dict such as
         # {"video": "/tmp/...mp4", "video_thumbnail": "..."}.
@@ -815,7 +825,10 @@ async def generate_video(request: Request):
 
         async def work():
             try:
-                client = await create_gemini_client()
+                video_timeout = float(
+                    os.getenv("GEMINI_VIDEO_TIMEOUT_SEC", "720")
+                )
+                client = await create_gemini_client(timeout_sec=video_timeout)
                 try:
                     generation_prompt = (
                         "Generate a short video for this request using Gemini's "
@@ -832,7 +845,18 @@ async def generate_video(request: Request):
                         response = await client.generate_content(generation_prompt)
 
                     videos = []
-                    for video in response.videos or []:
+                    video_objects = list(response.videos or [])
+
+                    # Newer gemini-webapi responses can expose generated
+                    # video through response.media as GeneratedMedia. Use the
+                    # explicit video download mode for that class so a valid
+                    # MP4 is not discarded just because response.videos is empty.
+                    if not video_objects:
+                        for media in response.media or []:
+                            if media.__class__.__name__ == "GeneratedMedia":
+                                video_objects.append(media)
+
+                    for video in video_objects:
                         if not getattr(video, "url", None):
                             continue
                         videos.append(
@@ -857,6 +881,7 @@ async def generate_video(request: Request):
                             "details": {
                                 "videos_returned": len(response.videos or []),
                                 "media_returned": len(response.media or []),
+                                "video_objects_checked": len(video_objects),
                                 "text": response.text or "",
                                 "check": (
                                     "Open Gemini Apps with the same Google account and "
