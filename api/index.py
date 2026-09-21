@@ -1,7 +1,8 @@
 import asyncio
 import json
 import os
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
+from http.server import BaseHTTPRequestHandler
 
 from gemini_webapi import GeminiClient
 
@@ -91,11 +92,11 @@ async def make_client():
     return client
 
 
-async def generate(prompt, files=None):
+async def generate(prompt, model_name=None, files=None):
     client = await make_client()
     try:
         model = None
-        requested = os.getenv("GEMINI_MODEL", "").strip()
+        requested = (model_name or os.getenv("GEMINI_MODEL", "")).strip()
         if requested:
             try:
                 model = client.resolve_model(requested)
@@ -142,7 +143,7 @@ def run(coro):
     return asyncio.run(coro)
 
 
-class handler(__import__("http.server").server.BaseHTTPRequestHandler):
+class handler(BaseHTTPRequestHandler):
     def send_json(self, status, data):
         raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
