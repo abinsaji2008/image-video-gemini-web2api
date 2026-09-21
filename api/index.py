@@ -148,15 +148,27 @@ def run(coro):
 
 
 def clean_path(raw_path):
-    """Normalize Vercel file-function paths to the public API path."""
-    path = urlparse(raw_path).path
-    prefixes = ("/api/index.py", "/api/index")
-    for prefix in prefixes:
+    """Normalize Vercel file-function paths to a public API path."""
+    path = urlparse(raw_path).path or "/"
+
+    # Vercel can invoke the Python file with the file path prepended.
+    for prefix in ("/api/index.py", "/api/index"):
         if path == prefix:
             return "/"
         if path.startswith(prefix + "/"):
             path = path[len(prefix):]
             break
+
+    # Also accept any prefix before our public API endpoint.
+    for endpoint in (
+        "/v1/images/generations",
+        "/v1/videos/generations",
+        "/v1/models",
+    ):
+        if endpoint in path:
+            path = endpoint
+            break
+
     if len(path) > 1:
         path = path.rstrip("/")
     return path or "/"
@@ -302,6 +314,6 @@ class handler(BaseHTTPRequestHandler):
                 )
                 return
 
-            self.send_json(404, {"error": {"message": "not found"}})
+            self.send_json(404, {"error": {"message": "not found", "path": self.path}})
         except Exception as exc:
             self.send_json(500, {"error": {"message": str(exc)}})
