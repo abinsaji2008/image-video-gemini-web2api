@@ -18,7 +18,7 @@ from gemini_webapi import GeminiClient
 from vercel.blob import AsyncBlobClient
 
 LOG = logging.getLogger(__name__)
-APP_VERSION = "5.3-public-blob-oidc-request"
+APP_VERSION = "5.4-clean-temp-media"
 
 app = FastAPI(
     title="Gemini Web Image/Video API",
@@ -192,6 +192,18 @@ async def publish_generated_image(
         file_path = Path(saved_path)
         raw = file_path.read_bytes()
 
+        # The Gemini image has been downloaded into Vercel's temporary
+        # filesystem. Remove the local copy immediately; only in-memory bytes
+        # are kept for the Blob upload.
+        try:
+            file_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            Path(tmp_dir).rmdir()
+        except OSError:
+            pass
+
         content_type = "image/png"
         detected = mimetypes.guess_type(file_path.name)[0]
         if detected and detected.startswith("image/"):
@@ -298,6 +310,8 @@ async def publish_generated_image(
         )
 
     finally:
+        # Safety cleanup in case download or upload fails before the early
+        # cleanup above runs.
         try:
             if Path(tmp_path).exists():
                 Path(tmp_path).unlink()
