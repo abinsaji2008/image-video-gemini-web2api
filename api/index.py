@@ -23,7 +23,7 @@ LOG = logging.getLogger(__name__)
 APP_VERSION = "7.0-long-video-image-fix"
 MEDIA_TTL_SEC = 3600
 IMAGE_MAX_ATTEMPTS = max(1, int(os.getenv("GEMINI_IMAGE_MAX_ATTEMPTS", "2")))
-VIDEO_TOTAL_TIMEOUT_SEC = float(os.getenv("GEMINI_VIDEO_MAX_SECONDS", "780"))
+VIDEO_TOTAL_TIMEOUT_SEC = min(780.0, max(60.0, float(os.getenv("GEMINI_VIDEO_MAX_SECONDS", "780")))
 VIDEO_MAX_ATTEMPTS = max(1, int(os.getenv("GEMINI_VIDEO_MAX_ATTEMPTS", "2")))
 VIDEO_RETRY_MIN_REMAINING_SEC = float(os.getenv("GEMINI_VIDEO_RETRY_MIN_REMAINING_SEC", "180"))
 
@@ -637,7 +637,7 @@ pre{margin:0;background:#070c16;border:1px solid #27344f;border-radius:11px;padd
 </head>
 <body>
 <main>
-<div class="top"><h1>Gemini Image + Video Generator</h1><p>Gemini Web cookies on the server. Generated media is stored in public Vercel Blob and automatically deleted after about 1 hour.</p></div>
+<div class="top"><h1>Gemini Image + Video Generator</h1><p>Gemini Web cookies on the server. Generated media is stored in public Vercel Blob with a 1-hour application retention window; actual deletion follows the cleanup cron.</p></div>
 <div class="tabs"><button class="tab active" data-kind="image">Image</button><button class="tab" data-kind="video">Video</button></div>
 <div class="grid">
 <section class="card">
@@ -899,7 +899,7 @@ async def generate_image(request: Request):
             "attempt": attempts,
             "note": (
                 "The returned URL is a public Vercel Blob URL. "
-                "Media retention is about 1 hour."
+                "The API uses a 1-hour application retention window; actual Blob deletion follows the configured cleanup cron."
             ),
         }
 
@@ -1051,7 +1051,8 @@ async def generate_video(request: Request):
                         payload["note"] = (
                             "Video generation is allowed to run for up to "
                             f"{int(VIDEO_TOTAL_TIMEOUT_SEC)} seconds. "
-                            "The public Blob result is retained for about 1 hour."
+                            "The API uses a 1-hour application retention window; "
+                            "actual Blob deletion follows the configured cleanup cron."
                         )
                         return payload
 
