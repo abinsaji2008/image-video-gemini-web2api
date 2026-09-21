@@ -20,7 +20,7 @@ from gemini_webapi import GeminiClient
 from vercel.blob import AsyncBlobClient
 
 LOG = logging.getLogger(__name__)
-APP_VERSION = "6.6-omni-flash-video-default"
+APP_VERSION = "6.7-video-auto-model-retry"
 MEDIA_TTL_SEC = 300
 
 app = FastAPI(
@@ -621,7 +621,7 @@ function stopClock(){clearInterval(timerId);timerId=null}
 function clearTTL(){clearInterval(ttlId);ttlId=null;$("ttl").textContent=""}
 function setTTL(ts){expiry=ts*1000;clearTTL();const tick=()=>{const left=Math.max(0,expiry-Date.now());const s=Math.floor(left/1000);if(s<=0){$("ttl").textContent="Media expired — cleanup is scheduled.";clearTTL();$("download").removeAttribute("href");return}$("ttl").textContent="Available for download for about "+Math.ceil(s/60)+" min ("+s+"s)"};tick();ttlId=setInterval(tick,1000)}
 function resetOutput(){$("image").style.display="none";$("video").style.display="none";$("empty").style.display="block";$("meta").classList.add("hidden");clearTTL()}
-function setKind(k){kind=k;$("go").textContent=k==="image"?"Generate Image":"Generate Video";$("prompt").placeholder=k==="image"?"A cinematic futuristic Kerala city at sunset":"A short cinematic video of waves on a tropical beach at sunset";if(k==="video"){$("model").value="gemini-omni-1.1-flash";$("model").placeholder="Gemini Omni Flash"}else{$("model").value="";$("model").placeholder="Leave empty for default"}resetOutput()}
+function setKind(k){kind=k;$("go").textContent=k==="image"?"Generate Image":"Generate Video";$("prompt").placeholder=k==="image"?"A cinematic futuristic Kerala city at sunset":"A short cinematic video of waves on a tropical beach at sunset";if(k==="video"){$("model").value="gemini-omni-1.1-flash";$("model").placeholder="Gemini Omni Flash (automatic video mode)"}else{$("model").value="";$("model").placeholder="Leave empty for default"}resetOutput()}
 document.querySelectorAll(".tab").forEach(b=>b.onclick=()=>{document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));b.classList.add("active");setKind(b.dataset.kind)});
 $("go").onclick=async()=>{
  const prompt=$("prompt").value.trim();if(!prompt){status("Enter a prompt.","err");return}
@@ -808,8 +808,20 @@ async def generate_video(request: Request):
     if model is not None and not isinstance(model, str):
         return error_response(400, "model must be a string", "invalid_request_error")
 
-    # Gemini Omni Flash is the dedicated current video-generation model.
-    video_model = (model or "gemini-omni-1.1-flash").strip()
+    # The website presents Gemini Omni Flash, but gemini-webapi discovers
+    # ordinary chat models separately. For the video capability, let Google
+    # select the video backend when Omni Flash is requested instead of forcing
+    # the model name through the ordinary chat-model parameter.
+    requested_video_model = (model or "gemini-omni-1.1-flash").strip()
+    generation_model = (
+        None
+        if requested_video_model.lower() in {
+            "gemini-omni-1.1-flash",
+            "omni-flash",
+            "omni flash",
+        }
+        else requested_video_model
+    )
 
     async def stream_result():
         # Cloudflare can return a gateway error when a long video-generation
@@ -827,57 +839,83 @@ async def generate_video(request: Request):
                 return
 
         async def work():
+            client = None
+            last_error: Exception | None = None
+
             try:
                 video_timeout = float(
-                    os.getenv("GEMINI_VIDEO_TIMEOUT_SEC", "720")
+                    os.getenv("GEMINI_VIDEO_TIMEOUT_SEC", "540")
                 )
-                client = await create_gemini_client(timeout_sec=video_timeout)
-                try:
-                    generation_prompt = (
-                        "Generate a short video for this request using Gemini's "
-                        "video generation capability.\n\n"
-                        + prompt.strip()
-                    )
+                generation_prompt = (
+                    "Generate a short video for this request using Gemini's "
+                    "video generation capability. Return the generated video, "
+                    "not only a text description.\n\n"
+                    + prompt.strip()
+                )
 
-                    if model:
-                        response = await client.generate_content(
-                            generation_prompt,
-                            model=video_model,
+                # Google can silently abort a WebAPI generation stream. Retry
+                # with a completely fresh Gemini session rather than reusing a
+                # client whose transport was already closed by gemini-webapi.
+                for attempt in range(1, 4):
+                    client = None
+                    try:
+                        client = await create_gemini_client(
+                            timeout_sec=video_timeout
                         )
-                    else:
-                        response = await client.generate_content(generation_prompt)
 
-                    videos = []
-                    video_objects = list(response.videos or [])
-
-                    # Newer gemini-webapi responses can expose generated
-                    # video through response.media as GeneratedMedia. Use the
-                    # explicit video download mode for that class so a valid
-                    # MP4 is not discarded just because response.videos is empty.
-                    if not video_objects:
-                        for media in response.media or []:
-                            if media.__class__.__name__ == "GeneratedMedia":
-                                video_objects.append(media)
-
-                    for video in video_objects:
-                        if not getattr(video, "url", None):
-                            continue
-                        videos.append(
-                            await publish_generated_video(
-                                video,
-                                client,
-                                oidc_token=request.headers.get("x-vercel-oidc-token"),
+                        if generation_model:
+                            response = await client.generate_content(
+                                generation_prompt,
+                                model=generation_model,
                             )
-                        )
+                        else:
+                            response = await client.generate_content(
+                                generation_prompt
+                            )
 
-                    if not videos:
+                        videos = []
+                        video_objects = list(response.videos or [])
+
+                        # Newer gemini-webapi responses can expose generated
+                        # video through response.media as GeneratedMedia.
+                        if not video_objects:
+                            for media in response.media or []:
+                                if media.__class__.__name__ == "GeneratedMedia":
+                                    video_objects.append(media)
+
+                        for video in video_objects:
+                            if not getattr(video, "url", None):
+                                continue
+                            videos.append(
+                                await publish_generated_video(
+                                    video,
+                                    client,
+                                    oidc_token=request.headers.get(
+                                        "x-vercel-oidc-token"
+                                    ),
+                                )
+                            )
+
+                        if videos:
+                            payload = {
+                                "created": int(time.time()),
+                                "object": "video.generation",
+                                "model": requested_video_model,
+                                "data": videos,
+                                "text": response.text or "",
+                                "attempt": attempt,
+                                "note": (
+                                    "The returned URL is a public Vercel Blob URL and "
+                                    "is scheduled for automatic deletion after 5 minutes."
+                                ),
+                            }
+                            break
+
                         payload = {
                             "error": {
                                 "message": (
-                                    "Gemini did not return a generated video. "
-                                    "This means the request reached Gemini, but video "
-                                    "generation is unavailable for the current Gemini "
-                                    "account/session or the feature was not activated."
+                                    "Gemini completed the request but returned no "
+                                    "generated video."
                                 ),
                                 "type": "video_feature_unavailable",
                             },
@@ -886,26 +924,35 @@ async def generate_video(request: Request):
                                 "media_returned": len(response.media or []),
                                 "video_objects_checked": len(video_objects),
                                 "text": response.text or "",
+                                "attempt": attempt,
                                 "check": (
-                                    "Open Gemini Apps with the same Google account and "
-                                    "verify that the Create video feature is available."
+                                    "Verify that Create video is available in Gemini "
+                                    "for the same Google account."
                                 ),
                             },
                         }
-                    else:
-                        payload = {
-                            "created": int(time.time()),
-                            "object": "video.generation",
-                            "model": video_model,
-                            "data": videos,
-                            "text": response.text or "",
-                            "note": (
-                                "The returned URL is a public Vercel Blob URL and "
-                                "is scheduled for automatic deletion after 5 minutes."
-                            ),
-                        }
-                finally:
-                    await client.close()
+
+                        # Empty video output is not a transport exception, so do
+                        # not blindly spend all retry attempts.
+                        break
+
+                    except Exception as exc:
+                        last_error = exc
+                        message = str(exc)
+                        retryable = "silently aborted by Google" in message.lower()
+
+                        if not retryable or attempt >= 3:
+                            raise
+
+                        await asyncio.sleep(2 * attempt)
+
+                    finally:
+                        if client is not None:
+                            try:
+                                await client.close()
+                            except Exception:
+                                pass
+                            client = None
 
             except ValueError as exc:
                 payload = {
@@ -925,6 +972,7 @@ async def generate_video(request: Request):
                     "error": {
                         "message": f"Gemini video generation failed: {exc}",
                         "type": "upstream_error",
+                        "retryable": "silently aborted by Google" in str(exc).lower(),
                     }
                 }
 
