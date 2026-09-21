@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -152,7 +152,7 @@ def make_proxy_url(request: Request, image_url: str) -> str:
     # Keep the response small: return a short API URL that fetches the image
     # later through the authenticated Gemini session.
     base = str(request.base_url).rstrip("/")
-    return f"{base}/api/v1/media/image?url={image_url.encode('utf-8').hex()}"
+    return f"{base}/api/v1/media/image?url={quote(image_url, safe='')}"
 
 
 async def fetch_image_with_gemini_session(image_url: str):
@@ -349,8 +349,7 @@ async def media_image(request: Request):
         return error_response(400, "url is required", "invalid_request_error")
 
     try:
-        # Hex is used instead of base64 to keep the URL unambiguous in a query string.
-        image_url = bytes.fromhex(encoded).decode("utf-8")
+        image_url = unquote(encoded)
     except Exception:
         return error_response(400, "invalid image URL token", "invalid_request_error")
 
