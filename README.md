@@ -22,7 +22,7 @@ Create a **PUBLIC** Vercel Blob store and connect it to this project:
 6. Make sure `BLOB_READ_WRITE_TOKEN` is available to the project's production environment.
 7. Redeploy.
 
-The Python SDK used by this project supports `AsyncBlobClient.put(..., access="public")`. citeturn507324search0turn964522search0
+The Python SDK used by this project uses the Vercel Blob read/write token from `BLOB_READ_WRITE_TOKEN` (or `VERCEL_BLOB_READ_WRITE_TOKEN`) and uploads with `access="public"`.
 
 ## Environment variables
 
@@ -174,7 +174,7 @@ Expected:
   "status": "ok",
   "service": "image-video-gemini-web2api",
   "auth": "gemini-web-cookie",
-  "version": "4.0-public-blob",
+  "version": "5.1-public-blob-token",
   "image_delivery": "public-vercel-blob"
 }
 ```
