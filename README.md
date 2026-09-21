@@ -246,6 +246,18 @@ Video generation now keeps the HTTP connection active with small heartbeat chunk
 
 The API no longer forces the old `gemini-omni-1.1-flash` alias. Leave `model` empty to let Gemini Web select the account's available video backend. The implementation also retries a Google "silently aborted" video request only when enough execution time remains.
 
-## Official Gemini image fallback
 
-When Gemini Web reports that image creation is unavailable, the API can automatically use Google's official Gemini Developer API. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) in Vercel Environment Variables. The fallback uses `gemini-3.1-flash-image` and uploads the returned inline image to the same public Vercel Blob path. Set `ENABLE_OFFICIAL_IMAGE_FALLBACK=false` to disable the fallback.
+
+## Cookie-only image generation
+
+The image endpoint uses Gemini Web cookies only. It does not use `GEMINI_API_KEY`, the Google Gen AI SDK, or another image-generation provider.
+
+The implementation patches Gemini Web's `StreamGenerate` request with the browser image-generation routing parameters and supports both the older generated-image response layout and the newer sparse response layout. The internal image model identifier defaults to `56fdd199312815e2` and can be overridden with `GEMINI_IMAGE_MODEL_ID` if Google rotates it.
+
+Required authentication remains:
+
+```text
+GEMINI_COOKIE=__Secure-1PSID=...; __Secure-1PSIDTS=...
+```
+
+No separate Gemini API key is required for the image endpoint.
