@@ -147,6 +147,21 @@ def run(coro):
     return asyncio.run(coro)
 
 
+def clean_path(raw_path):
+    """Normalize Vercel file-function paths to the public API path."""
+    path = urlparse(raw_path).path
+    prefixes = ("/api/index.py", "/api/index")
+    for prefix in prefixes:
+        if path == prefix:
+            return "/"
+        if path.startswith(prefix + "/"):
+            path = path[len(prefix):]
+            break
+    if len(path) > 1:
+        path = path.rstrip("/")
+    return path or "/"
+
+
 class handler(BaseHTTPRequestHandler):
     def send_json(self, status, data):
         raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -181,9 +196,9 @@ class handler(BaseHTTPRequestHandler):
         if not self.require_auth():
             return
 
-        parsed = urlparse(self.path)
+        path = clean_path(self.path)
 
-        if parsed.path == "/":
+        if path == "/":
             self.send_json(
                 200,
                 {
@@ -194,7 +209,7 @@ class handler(BaseHTTPRequestHandler):
             )
             return
 
-        if parsed.path == "/v1/models":
+        if path == "/v1/models":
             self.send_json(
                 200,
                 {
@@ -221,7 +236,7 @@ class handler(BaseHTTPRequestHandler):
         if not self.require_auth():
             return
 
-        parsed = urlparse(self.path)
+        path = clean_path(self.path)
         body = self.read_json()
 
         if body is None:
@@ -229,7 +244,7 @@ class handler(BaseHTTPRequestHandler):
             return
 
         try:
-            if parsed.path == "/v1/images/generations":
+            if path == "/v1/images/generations":
                 prompt = body.get("prompt")
                 if not isinstance(prompt, str) or not prompt.strip():
                     self.send_json(
@@ -258,7 +273,7 @@ class handler(BaseHTTPRequestHandler):
                 )
                 return
 
-            if parsed.path == "/v1/videos/generations":
+            if path == "/v1/videos/generations":
                 prompt = body.get("prompt")
                 if not isinstance(prompt, str) or not prompt.strip():
                     self.send_json(
