@@ -20,7 +20,7 @@ from gemini_webapi import GeminiClient
 from vercel.blob import AsyncBlobClient
 
 LOG = logging.getLogger(__name__)
-APP_VERSION = "6.7-video-auto-model-retry"
+APP_VERSION = "6.8-text-chat-api"
 MEDIA_TTL_SEC = 300
 
 app = FastAPI(
@@ -701,6 +701,85 @@ async def models(request: Request):
         return error_response(
             502,
             f"Gemini model discovery failed: {exc}",
+            "upstream_error",
+        )
+
+
+@app.post("/api/v1/chat/completions")
+async def chat_completions(request: Request):
+    if not authorize(request):
+        return error_response(401, "invalid API key", "invalid_api_key")
+
+    body = await request_json(request)
+    if body is None:
+        return error_response(400, "invalid JSON body", "invalid_request_error")
+
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return error_response(
+            400,
+            "messages must be a non-empty array",
+            "invalid_request_error",
+        )
+
+    parts = []
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if isinstance(content, str) and content.strip():
+            role = str(item.get("role", "user"))
+            parts.append(f"{role}: {content.strip()}")
+
+    if not parts:
+        return error_response(
+            400,
+            "messages must contain text content",
+            "invalid_request_error",
+        )
+
+    prompt = "\n".join(parts)
+    model = body.get("model")
+    if model is not None and not isinstance(model, str):
+        return error_response(400, "model must be a string", "invalid_request_error")
+
+    try:
+        client = await create_gemini_client()
+        try:
+            if model:
+                response = await client.generate_content(prompt, model=model)
+            else:
+                response = await client.generate_content(prompt)
+        finally:
+            await client.close()
+
+        text = response.text or ""
+        return {
+            "id": f"chatcmpl-{time.time_ns()}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model or "unspecified",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {},
+        }
+
+    except ValueError as exc:
+        return error_response(400, str(exc), "invalid_model")
+    except asyncio.TimeoutError:
+        return error_response(504, "Gemini request timed out", "timeout")
+    except RuntimeError as exc:
+        return error_response(503, str(exc), "configuration_error")
+    except Exception as exc:
+        LOG.exception("Chat completion failed")
+        return error_response(
+            502,
+            f"Gemini text generation failed: {exc}",
             "upstream_error",
         )
 
