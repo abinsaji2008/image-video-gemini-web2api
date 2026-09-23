@@ -171,6 +171,19 @@ POST https://YOUR_PROJECT.vercel.app/v1/videos/generations
 
 By default, this endpoint uses the Gemini Web **3.1 Pro** model as its coordinating model. Its current Web model identifier is `e6fa609c3fa255c0`.
 
+### Video direct-test mode
+
+For testing Gemini generation time without the extra MP4 download and Vercel Blob upload, send:
+
+```json
+{
+  "prompt": "A short cinematic video of waves on a tropical beach at sunset",
+  "direct_test": true
+}
+```
+
+In this mode the API returns Gemini's generated-video URL directly. The image endpoint is unaffected, and normal video publishing remains available when `direct_test` is omitted or false.
+
 Body:
 
 ```json
