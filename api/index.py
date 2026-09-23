@@ -1268,14 +1268,90 @@ async def generate_video(request: Request):
                 timeout_sec=per_attempt_timeout,
                 credential_profile="video",
             )
+            recovery_client = None
+            generation_task = None
             try:
-                if generation_model:
-                    response = await client.generate_content(
+                # Keep a ChatSession so Gemini gives us the CID for the turn.
+                # The video job can continue server-side after the original stream
+                # stalls; history is then the recovery source of truth.
+                chat = client.start_chat(model=generation_model)
+
+                generation_task = asyncio.create_task(
+                    client.generate_content(
                         generation_prompt,
                         model=generation_model,
+                        chat=chat,
                     )
-                else:
-                    response = await client.generate_content(generation_prompt)
+                )
+
+                response = None
+                generation_error = None
+                recovery_deadline = time.monotonic() + max(
+                    30.0, min(per_attempt_timeout, 300.0)
+                )
+
+                def _has_video(output: Any) -> bool:
+                    try:
+                        if output and output.videos:
+                            return True
+                        if output and output.media:
+                            return any(
+                                media.__class__.__name__ == "GeneratedMedia"
+                                and getattr(media, "url", None)
+                                for media in output.media
+                            )
+                    except Exception:
+                        pass
+                    return False
+
+                while True:
+                    if generation_task.done():
+                        try:
+                            response = generation_task.result()
+                        except Exception as exc:
+                            generation_error = exc
+                        else:
+                            if _has_video(response):
+                                break
+
+                    # As soon as the original request has a CID, use a second
+                    # connection to read the persisted Gemini conversation.
+                    if chat.cid and recovery_client is None:
+                        try:
+                            recovery_client = await create_gemini_client(
+                                timeout_sec=30.0,
+                                credential_profile="video",
+                            )
+                        except Exception:
+                            recovery_client = None
+
+                    if chat.cid and recovery_client is not None:
+                        try:
+                            recovered = await recovery_client.fetch_latest_chat_response(
+                                chat.cid,
+                                limit=10,
+                                match=_has_video,
+                            )
+                            if recovered and _has_video(recovered):
+                                response = recovered
+                                if generation_task and not generation_task.done():
+                                    generation_task.cancel()
+                                    with contextlib.suppress(asyncio.CancelledError):
+                                        await generation_task
+                                break
+                        except Exception:
+                            pass
+
+                    if time.monotonic() >= recovery_deadline:
+                        if generation_error is not None:
+                            raise generation_error
+                        raise RuntimeError(
+                            "Gemini accepted the video prompt and saved it to history, "
+                            "but no generated video was recoverable from conversation history "
+                            "before the test timeout."
+                        )
+
+                    await asyncio.sleep(5)
 
                 video_objects = list(response.videos or [])
                 if not video_objects:
@@ -1284,11 +1360,11 @@ async def generate_video(request: Request):
                             video_objects.append(media)
 
                 if not video_objects:
-                    raise RuntimeError("Gemini returned no generated video object.")
+                    raise RuntimeError(
+                        "Gemini returned a completed history turn but no generated video object."
+                    )
 
                 # Test path: do not call video.save() and do not upload the file.
-                # This measures Gemini generation time independently of Blob/download
-                # overhead and avoids the extra polling performed by Video.save().
                 if direct_test:
                     direct_data = []
                     for video in video_objects:
@@ -1354,6 +1430,15 @@ async def generate_video(request: Request):
                     response,
                 )
             finally:
+                if generation_task and not generation_task.done():
+                    generation_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await generation_task
+                if recovery_client is not None:
+                    try:
+                        await recovery_client.close()
+                    except Exception:
+                        pass
                 try:
                     await client.close()
                 except Exception:
