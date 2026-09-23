@@ -1236,8 +1236,9 @@ async def generate_video(request: Request):
     if model is not None and not isinstance(model, str):
         return error_response(400, "model must be a string", "invalid_request_error")
 
-    # Do not force the obsolete/hard-coded "Omni" alias. With no ordinary
-    # chat model supplied, Gemini Web can select the account's video backend.
+    # Video generation uses Gemini 3.1 Pro as the coordinating Web model.
+    # The current Gemini Web model hash is e6fa609c3fa255c0.
+    # Callers may still explicitly request another supported model.
     requested_video_model = (model or "").strip()
     if requested_video_model.lower() in {
         "",
@@ -1247,8 +1248,8 @@ async def generate_video(request: Request):
         "omni-flash",
         "omni flash",
     }:
-        generation_model = None
-        public_model = "automatic"
+        generation_model = "gemini-3.1-pro"
+        public_model = "gemini-3.1-pro"
     else:
         generation_model = requested_video_model
         public_model = requested_video_model
