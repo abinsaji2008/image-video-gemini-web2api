@@ -1254,6 +1254,11 @@ async def generate_video(request: Request):
         generation_model = requested_video_model
         public_model = requested_video_model
 
+    # TEST ONLY: when enabled for a request, return Gemini's generated-video
+    # URL directly instead of downloading the MP4 and uploading it to Blob.
+    # This is intentionally video-only; image generation is unchanged.
+    direct_test = bool(body.get("direct_test", False))
+
     async def generate_video_once(
         generation_prompt: str,
         per_attempt_timeout: float,
@@ -1280,6 +1285,46 @@ async def generate_video(request: Request):
 
                 if not video_objects:
                     raise RuntimeError("Gemini returned no generated video object.")
+
+                # Test path: do not call video.save() and do not upload the file.
+                # This measures Gemini generation time independently of Blob/download
+                # overhead and avoids the extra polling performed by Video.save().
+                if direct_test:
+                    direct_data = []
+                    for video in video_objects:
+                        video_url = getattr(video, "url", None)
+                        if not video_url:
+                            continue
+                        direct_data.append(
+                            {
+                                "url": video_url,
+                                "title": getattr(video, "title", None),
+                                "thumbnail": getattr(video, "thumbnail", None),
+                                "type": "generated",
+                            }
+                        )
+
+                    if not direct_data:
+                        raise RuntimeError(
+                            "Gemini returned video metadata but no video URL."
+                        )
+
+                    return (
+                        {
+                            "created": int(time.time()),
+                            "object": "video.generation",
+                            "model": public_model,
+                            "data": direct_data,
+                            "text": response.text or "",
+                            "delivery": "direct_test",
+                            "note": (
+                                "TEST MODE: video generation returned the Gemini "
+                                "Web URL directly. No video download or Vercel Blob "
+                                "upload was performed."
+                            ),
+                        },
+                        response,
+                    )
 
                 published = []
                 for video in video_objects:
