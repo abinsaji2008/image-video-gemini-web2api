@@ -110,18 +110,65 @@ def parse_cookie(value: str | None) -> tuple[str | None, str | None]:
     )
 
 
-def get_credentials() -> tuple[str, str | None]:
-    psid, psidts = parse_cookie(os.getenv("GEMINI_COOKIE"))
-    psid = psid or os.getenv("GEMINI_1PSID", "").strip()
-    psidts = psidts or os.getenv("GEMINI_1PSIDTS", "").strip() or None
+def get_credentials(profile: str = "general") -> tuple[str, str | None]:
+    """Return Gemini Web credentials for the requested feature profile.
+
+    Supported profiles:
+      - general: legacy/shared credentials used by chat and model discovery.
+      - image: dedicated image-generation credentials.
+      - video: dedicated video-generation credentials.
+
+    Feature-specific credentials take precedence. For backward compatibility,
+    image/video fall back to the legacy GEMINI_* credentials when their own
+    profile is not configured.
+    """
+    normalized = (profile or "general").strip().lower()
+    if normalized not in {"general", "image", "video"}:
+        normalized = "general"
+
+    prefix = {
+        "general": "GEMINI",
+        "image": "GEMINI_IMAGE",
+        "video": "GEMINI_VIDEO",
+    }[normalized]
+
+    cookie_value = os.getenv(f"{prefix}_COOKIE", "").strip()
+    psid, psidts = parse_cookie(cookie_value)
+    psid = psid or os.getenv(f"{prefix}_1PSID", "").strip()
+    psidts = psidts or os.getenv(f"{prefix}_1PSIDTS", "").strip() or None
+
+    # Preserve the existing single-cookie deployment format.
+    if normalized in {"image", "video"} and not psid:
+        legacy_psid, legacy_psidts = parse_cookie(
+            os.getenv("GEMINI_COOKIE", "")
+        )
+        psid = legacy_psid or os.getenv("GEMINI_1PSID", "").strip()
+        psidts = (
+            legacy_psidts
+            or os.getenv("GEMINI_1PSIDTS", "").strip()
+            or psidts
+            or None
+        )
 
     if not psid:
+        if normalized == "image":
+            raise RuntimeError(
+                "Gemini image cookie is not configured. Set "
+                "GEMINI_IMAGE_COOKIE with __Secure-1PSID or set "
+                "GEMINI_IMAGE_1PSID."
+            )
+        if normalized == "video":
+            raise RuntimeError(
+                "Gemini video cookie is not configured. Set "
+                "GEMINI_VIDEO_COOKIE with __Secure-1PSID or set "
+                "GEMINI_VIDEO_1PSID."
+            )
         raise RuntimeError(
             "Gemini cookie is not configured. Set GEMINI_COOKIE with "
             "__Secure-1PSID or set GEMINI_1PSID."
         )
 
-    return psid, psidts
+    return str(psid), str(psidts) if psidts else None
 
 
 def authorize(request: Request) -> bool:
@@ -355,7 +402,8 @@ async def _generate_web_image(
 
             for attempt in range(1, GEMINI_IMAGE_MAX_ATTEMPTS + 1):
                 client = await create_gemini_client(
-                    timeout_sec=GEMINI_IMAGE_REQUEST_TIMEOUT_SEC
+                    timeout_sec=GEMINI_IMAGE_REQUEST_TIMEOUT_SEC,
+                    credential_profile="image",
                 )
                 try:
                     _patch_image_request(client)
@@ -413,8 +461,9 @@ async def _generate_web_image(
 
 async def create_gemini_client(
     timeout_sec: float | None = None,
+    credential_profile: str = "general",
 ) -> GeminiClient:
-    psid, psidts = get_credentials()
+    psid, psidts = get_credentials(credential_profile)
     client = GeminiClient(psid, psidts, proxy=None)
     timeout = (
         float(timeout_sec)
@@ -1119,6 +1168,7 @@ async def generate_image(request: Request):
                 "text": response.text or "" if response else "",
                 "image_model_id": GEMINI_IMAGE_MODEL_ID,
                 "web_only": True,
+                "credential_profile": "image",
                 "check": (
                     "The endpoint uses Gemini Web cookies only. If Gemini Web "
                     "itself says image creation is unavailable, a code change "
@@ -1211,7 +1261,10 @@ async def generate_video(request: Request):
         per_attempt_timeout: float,
     ) -> tuple[dict[str, Any], Any]:
         async def _work():
-            client = await create_gemini_client(timeout_sec=per_attempt_timeout)
+            client = await create_gemini_client(
+                timeout_sec=per_attempt_timeout,
+                credential_profile="video",
+            )
             try:
                 if generation_model:
                     response = await client.generate_content(
