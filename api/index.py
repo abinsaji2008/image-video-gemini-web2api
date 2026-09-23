@@ -139,7 +139,7 @@ def get_credentials(profile: str = "general") -> tuple[str, str | None]:
 
     # Preserve the existing single-cookie deployment format.
     if normalized in {"image", "video"} and not psid:
-        legacy_psid, legacy_psidts = parse_cookie(
+        legacy_psid, _legacy_psidts = parse_cookie(
             os.getenv("GEMINI_COOKIE", "")
         )
         psid = legacy_psid or os.getenv("GEMINI_1PSID", "").strip()
