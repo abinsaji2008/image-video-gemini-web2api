@@ -1420,6 +1420,22 @@ async def generate_video(request: Request):
                         except Exception:
                             pass
 
+                if web_search and not web_context:
+                    return {
+                        "error": {
+                            "message": str(last_error or RuntimeError(
+                                "Gemini Web returned no web-research text."
+                            )),
+                            "type": "web_search_failed",
+                            "retryable": False,
+                        },
+                        "details": {
+                            "elapsed_seconds": round(time.monotonic() - started, 1),
+                            "model": public_model,
+                            "web_search": True,
+                        },
+                    }
+
                 if web_context:
                     generation_prompt = (
                         "Generate a short AI video for this request using the web "
