@@ -1385,6 +1385,53 @@ async def generate_video(request: Request):
                 + prompt.strip()
             )
 
+            web_context = ""
+            if web_search:
+                search_client = None
+                search_started = time.monotonic()
+                try:
+                    search_client = await create_gemini_client(
+                        timeout_sec=min(90.0, max(30.0, deadline - time.monotonic() - 120.0)),
+                        credential_profile="video",
+                    )
+                    search_prompt = (
+                        "Search the web now for the current information needed to answer "
+                        "the following video request. Use current web sources when available. "
+                        "Do not generate a video in this step. Return a concise factual "
+                        "research summary with source names and URLs when present.\n\n"
+                        + prompt.strip()
+                    )
+                    search_response = await asyncio.wait_for(
+                        search_client.generate_content(
+                            search_prompt,
+                            model="gemini-3.1-pro",
+                        ),
+                        timeout=min(90.0, max(30.0, deadline - time.monotonic() - 120.0)),
+                    )
+                    web_context = (search_response.text or "").strip()
+                except Exception as exc:
+                    last_error = RuntimeError(
+                        f"Gemini Web research step failed: {exc}"
+                    )
+                finally:
+                    if search_client is not None:
+                        try:
+                            await search_client.close()
+                        except Exception:
+                            pass
+
+                if web_context:
+                    generation_prompt = (
+                        "Generate a short AI video for this request using the web "
+                        "research context below. Do not invent facts that conflict with "
+                        "the research. Return the generated video, not only a text "
+                        "description.\n\n"
+                        "VIDEO REQUEST:\n"
+                        + prompt.strip()
+                        + "\n\nWEB RESEARCH CONTEXT:\n"
+                        + web_context
+                    )
+
             try:
                 for attempt in range(1, VIDEO_MAX_ATTEMPTS + 1):
                     remaining = deadline - time.monotonic()
