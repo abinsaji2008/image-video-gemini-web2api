@@ -26,7 +26,30 @@ The project uses Vercel Blob OIDC for production uploads. Vercel documents that 
 
 ## Environment variables
 
-Gemini authentication:
+Gemini Web authentication supports separate sessions for image and video generation.
+
+### Recommended: separate image/video cookies
+
+```text
+GEMINI_IMAGE_COOKIE=__Secure-1PSID=IMAGE_PSID; __Secure-1PSIDTS=IMAGE_PSIDTS
+GEMINI_VIDEO_COOKIE=__Secure-1PSID=VIDEO_PSID; __Secure-1PSIDTS=VIDEO_PSIDTS
+```
+
+Or enter the individual cookie values:
+
+```text
+GEMINI_IMAGE_1PSID=IMAGE_PSID
+GEMINI_IMAGE_1PSIDTS=IMAGE_PSIDTS
+
+GEMINI_VIDEO_1PSID=VIDEO_PSID
+GEMINI_VIDEO_1PSIDTS=VIDEO_PSIDTS
+```
+
+The image endpoint uses only the image profile, and the video endpoint uses only the video profile. This allows the two endpoints to use different Gemini Web accounts or sessions.
+
+### Backward compatibility
+
+A single shared cookie is still supported:
 
 ```text
 GEMINI_COOKIE=__Secure-1PSID=YOUR_VALUE; __Secure-1PSIDTS=YOUR_VALUE
@@ -38,6 +61,9 @@ or:
 GEMINI_1PSID=YOUR_VALUE
 GEMINI_1PSIDTS=YOUR_VALUE
 ```
+
+When a feature-specific cookie is not configured, image/video generation falls back to these legacy variables.
+
 
 Blob:
 
