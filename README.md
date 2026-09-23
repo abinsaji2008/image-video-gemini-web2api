@@ -181,6 +181,19 @@ For testing Gemini generation time without the extra MP4 download and Vercel Blo
   "direct_test": true
 }
 ```
+### Video web-search test
+
+To test current web grounding before video generation, add `web_search: true`:
+
+```json
+{
+  "prompt": "Create a short video about the latest winner of the Formula 1 race in Singapore",
+  "web_search": true,
+  "direct_test": true
+}
+```
+
+The API first asks the video Gemini Web session to research the request, then injects that research into the video prompt. This is video-only and does not change the image endpoint.
 
 In this mode the API returns Gemini's generated-video URL directly. The image endpoint is unaffected, and normal video publishing remains available when `direct_test` is omitted or false.
 
