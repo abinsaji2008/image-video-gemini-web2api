@@ -143,12 +143,9 @@ def get_credentials(profile: str = "general") -> tuple[str, str | None]:
             os.getenv("GEMINI_COOKIE", "")
         )
         psid = legacy_psid or os.getenv("GEMINI_1PSID", "").strip()
-        psidts = (
-            legacy_psidts
-            or os.getenv("GEMINI_1PSIDTS", "").strip()
-            or psidts
-            or None
-        )
+        # Do not combine a feature-specific PSID with an unrelated legacy
+        # PSIDTS. If the dedicated profile has only one cookie, let the
+        # upstream client handle the optional PSIDTS consistently.
 
     if not psid:
         if normalized == "image":
