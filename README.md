@@ -169,6 +169,8 @@ The video endpoint remains:
 POST https://YOUR_PROJECT.vercel.app/v1/videos/generations
 ```
 
+By default, this endpoint uses the Gemini Web **3.1 Pro** model as its coordinating model. Its current Web model identifier is `e6fa609c3fa255c0`.
+
 Body:
 
 ```json
