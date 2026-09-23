@@ -1388,7 +1388,6 @@ async def generate_video(request: Request):
             web_context = ""
             if web_search:
                 search_client = None
-                search_started = time.monotonic()
                 try:
                     search_client = await create_gemini_client(
                         timeout_sec=min(90.0, max(30.0, deadline - time.monotonic() - 120.0)),
