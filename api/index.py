@@ -1143,6 +1143,9 @@ async def chat_completions(request: Request):
     if model is not None and not isinstance(model, str):
         return error_response(400, "model must be a string", "invalid_request_error")
 
+    # Chat responses are always buffered into one complete answer.
+    # The OpenAI-style "stream" flag is intentionally ignored so this endpoint
+    # never exposes reasoning/token chunks to the caller.
     client = None
     invalidate_session = False
     try:
@@ -1156,8 +1159,10 @@ async def chat_completions(request: Request):
             response = await client.generate_content(prompt)
 
         text = response.text or ""
-        return {
-            "id": f"chatcmpl-{time.time_ns()}",
+        # Return one normal JSON response containing the complete answer.
+        return JSONResponse(
+            {
+                "id": f"chatcmpl-{time.time_ns()}",
             "object": "chat.completion",
             "created": int(time.time()),
             "model": model or "unspecified",
@@ -1168,8 +1173,13 @@ async def chat_completions(request: Request):
                     "finish_reason": "stop",
                 }
             ],
-            "usage": {},
-        }
+                "usage": {},
+            },
+            headers={
+                "Cache-Control": "no-store",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     except ValueError as exc:
         return error_response(400, str(exc), "invalid_model")
