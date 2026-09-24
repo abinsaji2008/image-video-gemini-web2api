@@ -24,7 +24,7 @@ from gemini_webapi.utils import get_nested_value
 from vercel.blob import AsyncBlobClient
 
 LOG = logging.getLogger(__name__)
-APP_VERSION = "7.0-long-video-image-fix"
+APP_VERSION = "7.1-warm-chat-session"
 MEDIA_TTL_SEC = 3600
 VIDEO_TOTAL_TIMEOUT_SEC = min(300.0, max(60.0, float(os.getenv("GEMINI_VIDEO_MAX_SECONDS", "300"))))
 VIDEO_MAX_ATTEMPTS = max(1, int(os.getenv("GEMINI_VIDEO_MAX_ATTEMPTS", "2")))
@@ -34,9 +34,16 @@ VIDEO_RETRY_MIN_REMAINING_SEC = float(os.getenv("GEMINI_VIDEO_RETRY_MIN_REMAININ
 GEMINI_IMAGE_MODEL_ID = os.getenv("GEMINI_IMAGE_MODEL_ID", "56fdd199312815e2").strip()
 GEMINI_IMAGE_MAX_ATTEMPTS = max(1, int(os.getenv("GEMINI_IMAGE_MAX_ATTEMPTS", "2")))
 GEMINI_IMAGE_REQUEST_TIMEOUT_SEC = min(300.0, max(30.0, float(os.getenv("GEMINI_IMAGE_REQUEST_TIMEOUT_SEC", "300"))))
+# General chat sessions reuse the authenticated Gemini Web client for a short
+# inactivity window. This avoids rebuilding the Gemini session for every question.
+CHAT_SESSION_IDLE_SEC = 300.0
 _IMAGE_PATCH_LOCK = asyncio.Lock()
 _IMAGE_MODE = False
 _IMAGE_PATCHED = False
+_CHAT_CLIENT: GeminiClient | None = None
+_CHAT_CLIENT_LAST_ACTIVITY = 0.0
+_CHAT_CLIENT_ACTIVE = 0
+_CHAT_CLIENT_LOCK = asyncio.Lock()
 
 app = FastAPI(
     title="Gemini Web Image/Video API",
@@ -475,6 +482,51 @@ async def create_gemini_client(
         auto_refresh=True,
     )
     return client
+
+
+async def get_shared_chat_client() -> GeminiClient:
+    """Return the shared general Gemini client, refreshing after 300s idle."""
+    global _CHAT_CLIENT, _CHAT_CLIENT_LAST_ACTIVITY, _CHAT_CLIENT_ACTIVE
+
+    async with _CHAT_CLIENT_LOCK:
+        now = time.monotonic()
+
+        if (
+            _CHAT_CLIENT is not None
+            and _CHAT_CLIENT_ACTIVE == 0
+            and now - _CHAT_CLIENT_LAST_ACTIVITY >= CHAT_SESSION_IDLE_SEC
+        ):
+            old_client = _CHAT_CLIENT
+            _CHAT_CLIENT = None
+            _CHAT_CLIENT_LAST_ACTIVITY = 0.0
+            with contextlib.suppress(Exception):
+                await old_client.close()
+
+        if _CHAT_CLIENT is None:
+            _CHAT_CLIENT = await create_gemini_client()
+
+        _CHAT_CLIENT_ACTIVE += 1
+        _CHAT_CLIENT_LAST_ACTIVITY = now
+        return _CHAT_CLIENT
+
+
+async def release_shared_chat_client(
+    client: GeminiClient,
+    *,
+    invalidate: bool = False,
+) -> None:
+    """Release the shared client and optionally discard a broken session."""
+    global _CHAT_CLIENT, _CHAT_CLIENT_LAST_ACTIVITY, _CHAT_CLIENT_ACTIVE
+
+    async with _CHAT_CLIENT_LOCK:
+        _CHAT_CLIENT_ACTIVE = max(0, _CHAT_CLIENT_ACTIVE - 1)
+        _CHAT_CLIENT_LAST_ACTIVITY = time.monotonic()
+
+        if invalidate and _CHAT_CLIENT is client:
+            _CHAT_CLIENT = None
+            _CHAT_CLIENT_LAST_ACTIVITY = 0.0
+            with contextlib.suppress(Exception):
+                await client.close()
 
 
 async def generate_with_client(
@@ -1091,15 +1143,17 @@ async def chat_completions(request: Request):
     if model is not None and not isinstance(model, str):
         return error_response(400, "model must be a string", "invalid_request_error")
 
+    client = None
+    invalidate_session = False
     try:
-        client = await create_gemini_client()
-        try:
-            if model:
-                response = await client.generate_content(prompt, model=model)
-            else:
-                response = await client.generate_content(prompt)
-        finally:
-            await client.close()
+        # Reuse the authenticated Gemini Web client for up to 300s of inactivity.
+        # This preserves normal Gemini reasoning while avoiding client/session setup
+        # overhead on each follow-up question.
+        client = await get_shared_chat_client()
+        if model:
+            response = await client.generate_content(prompt, model=model)
+        else:
+            response = await client.generate_content(prompt)
 
         text = response.text or ""
         return {
@@ -1120,16 +1174,25 @@ async def chat_completions(request: Request):
     except ValueError as exc:
         return error_response(400, str(exc), "invalid_model")
     except asyncio.TimeoutError:
+        invalidate_session = True
         return error_response(504, "Gemini request timed out", "timeout")
     except RuntimeError as exc:
+        invalidate_session = True
         return error_response(503, str(exc), "configuration_error")
     except Exception as exc:
+        invalidate_session = True
         LOG.exception("Chat completion failed")
         return error_response(
             502,
             f"Gemini text generation failed: {exc}",
             "upstream_error",
         )
+    finally:
+        if client is not None:
+            await release_shared_chat_client(
+                client,
+                invalidate=invalidate_session,
+            )
 
 
 @app.post("/api/v1/images/generations")
